@@ -156,11 +156,12 @@ def build_graph(fast, main, checkpointer=None):
             return {
                 "reply": d.get("reply_draft") or "Could you share your order ID and a few more details?",
                 "resolution": "needs_info",
+                "audit": ["respond: clarification prepared"],
             }
         msg = fast.invoke(
             [("system", RESPOND_PROMPT), ("human", f"Customer message: {s['message']}\nTool result: {json.dumps(s['tool_result'])}")]
         )
-        return {"reply": msg.content, "resolution": "resolved"}
+        return {"reply": msg.content, "resolution": "resolved", "audit": ["respond: customer reply prepared"]}
 
     def escalate(s: State):
         if s.get("approval") == "rejected":
@@ -179,10 +180,11 @@ def build_graph(fast, main, checkpointer=None):
 
     def log(s: State):
         record = {k: s.get(k) for k in ("ticket_id", "intent", "resolution", "reply", "audit")}
+        record["audit"] = [*s.get("audit", []), "log: audit record written"]
         record["ts"] = time.time()
         with open(AUDIT_PATH, "a") as f:
             f.write(json.dumps(record) + "\n")
-        return {}
+        return {"audit": ["log: audit record written"]}
 
     # ---- routing ----
     def after_decide(s: State):

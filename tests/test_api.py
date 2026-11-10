@@ -67,3 +67,41 @@ def test_validation_and_demo(client):
     assert client.post("/tickets", json={"message": "hello there", "email": ""}).status_code == 422
     assert len(client.get("/demo/orders").json()) == 5
     assert client.post("/demo/reset").json() == {"ok": True}
+
+
+def test_streaming_ticket_queue_detail_and_analytics(client):
+    streamed = client.post("/tickets/stream", json={"message": "Please refund order A1002", "email": "b@example.com"})
+    assert streamed.status_code == 200
+    assert "event: progress" in streamed.text
+    assert "event: complete" in streamed.text
+    assert '"status": "pending_approval"' in streamed.text
+
+    queued = client.get("/agent/approvals").json()
+    assert len(queued) == 1
+    item = queued[0]
+    assert item["decision"]["tool_name"] == "issue_refund"
+    assert item["policy_result"]["needs_approval"] is True
+    assert item["order"]["order_id"] == "A1002"
+
+    ticket_id = item["ticket_id"]
+    detail = client.get(f"/tickets/{ticket_id}").json()
+    assert detail["policy_result"]["needs_approval"] is True
+    assert detail["audit"]
+    assert client.get("/analytics").json()["total_tickets"] == 1
+
+    approved = client.post(f"/tickets/{ticket_id}/approval", json={"decision": "approve"})
+    assert approved.json()["status"] == "resolved"
+    assert client.get("/agent/approvals").json() == []
+    metrics = client.get("/analytics").json()
+    assert metrics["auto_resolution_rate"] == 0.0
+    assert metrics["approval_rate"] == 100.0
+    assert client.get("/tickets").json()[0]["ticket_id"] == ticket_id
+    final_detail = client.get(f"/tickets/{ticket_id}").json()
+    assert final_detail["audit"][-2:] == ["respond: customer reply prepared", "log: audit record written"]
+
+
+def test_streaming_small_ticket_includes_all_graph_steps(client):
+    response = client.post("/tickets/stream", json={"message": "Where is order A1001?", "email": "a@example.com"})
+    assert response.status_code == 200
+    for event_name in ("classify", "retrieve_context", "decide", "policy_check", "execute_tool", "respond", "log"):
+        assert f'"name": "{event_name}"' in response.text
