@@ -11,8 +11,11 @@ from langgraph.types import interrupt
 from . import policy as P
 from . import tools as T
 from .config import AUDIT_PATH, MAX_LOOPS
+from .logging_config import configure_logging
 from .retrieval import retrieve_policies
 from .schemas import Classification, Decision
+
+logger = configure_logging()
 
 
 class State(TypedDict, total=False):
@@ -184,6 +187,7 @@ def build_graph(fast, main, checkpointer=None):
         record["ts"] = time.time()
         with open(AUDIT_PATH, "a") as f:
             f.write(json.dumps(record) + "\n")
+        logger.info("Ticket audit record written", extra={"ticket_id": s.get("ticket_id")})
         return {"audit": ["log: audit record written"]}
 
     # ---- routing ----

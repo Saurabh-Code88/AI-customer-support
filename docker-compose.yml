@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-support_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-support_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_support_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://support_agent:local_support_password@db:5432/support_agent}
+      DATABASE_CONNECT_TIMEOUT: ${DATABASE_CONNECT_TIMEOUT:-3}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      MAIN_PROVIDER: ${MAIN_PROVIDER:-gemini}
+      PORT: ${PORT:-8000}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUDIT_PATH: /var/lib/support-agent/audit.jsonl
+      REFUND_WINDOW_DAYS: ${REFUND_WINDOW_DAYS:-30}
+      REFUND_AUTO_LIMIT: ${REFUND_AUTO_LIMIT:-2000}
+      MAX_LOOPS: ${MAX_LOOPS:-2}
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - audit_data:/var/lib/support-agent
+
+volumes:
+  postgres_data:
+  audit_data:

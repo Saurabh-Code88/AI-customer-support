@@ -3,9 +3,9 @@
 Run:  python -m uvicorn support_agent.api:app --reload      (from the project folder, with PYTHONPATH=src)
 Open: http://127.0.0.1:8000
 """
-import uuid
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -16,8 +16,11 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from . import tools
+from .database import database_ready
+from .logging_config import configure_logging, ticket_context
 
 STATIC = Path(__file__).parent / "static"
+logger = configure_logging()
 
 
 class TicketIn(BaseModel):
@@ -89,29 +92,39 @@ def create_app(graph=None) -> FastAPI:
     def health():
         return {"ok": True}
 
+    @app.get("/ready")
+    def ready():
+        if not database_ready():
+            logger.warning("Readiness probe failed: database unavailable")
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        return {"ok": True, "database": "ready"}
+
     @app.get("/")
     def index():
         return FileResponse(STATIC / "index.html")
 
     @app.post("/tickets")
     def create_ticket(body: TicketIn):
-        g = get_graph()
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
-        result = g.invoke(
-            {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": body.email.strip()},
-            cfg(ticket_id),
-        )
-        pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
-        remember(ticket_id, {**result, "message": body.message.strip(), "customer_email": body.email.strip(), "approval": "pending" if pending else result.get("approval")}, created_at=created_at)
+        with ticket_context(ticket_id):
+            logger.info("Ticket processing started")
+            g = get_graph()
+            result = g.invoke(
+                {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": body.email.strip()},
+                cfg(ticket_id),
+            )
+            pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
+            remember(ticket_id, {**result, "message": body.message.strip(), "customer_email": body.email.strip(), "approval": "pending" if pending else result.get("approval")}, created_at=created_at)
+            logger.info("Ticket processing paused for approval" if pending else "Ticket processing completed")
         return _shape(ticket_id, result, pending)
 
     @app.post("/tickets/stream")
     def create_ticket_stream(body: TicketIn):
-        g = get_graph()
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
         initial = {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": body.email.strip()}
+        g = get_graph()
 
         def events():
             steps = []
@@ -121,49 +134,57 @@ def create_app(graph=None) -> FastAPI:
                 "human_approval": "Await human approval", "execute_tool": "Execute action",
                 "respond": "Prepare response", "escalate": "Escalate to support", "log": "Record audit trail",
             }
+            logger.info("Streaming ticket processing started", extra={"ticket_id": ticket_id})
             yield f"event: ticket\ndata: {json.dumps({'ticket_id': ticket_id})}\n\n"
             try:
                 for update in g.stream(initial, cfg(ticket_id), stream_mode="updates"):
                     for node in update:
                         step = {"name": node, "label": labels.get(node, node.replace("_", " ").title()), "status": "complete", "at": time.time()}
                         steps.append(step)
+                        logger.info("Graph step completed", extra={"ticket_id": ticket_id, "graph_step": node})
                         yield f"event: progress\ndata: {json.dumps(step)}\n\n"
                 values = current_values(g, ticket_id)
                 pending = values.get("__interrupt__", [None])[0]
                 pending_payload = pending.get("value") if pending else None
                 values.update({"message": initial["message"], "customer_email": initial["customer_email"], "approval": "pending" if pending_payload else values.get("approval")})
                 remember(ticket_id, values, created_at=created_at, steps=steps)
+                logger.info("Ticket processing paused for approval" if pending_payload else "Ticket processing completed", extra={"ticket_id": ticket_id})
                 yield f"event: complete\ndata: {json.dumps(_shape(ticket_id, values, pending_payload))}\n\n"
-            except Exception as exc:  # noqa: BLE001 - report a safe, user-visible stream error
+            except Exception:
+                logger.exception("Ticket streaming failed", extra={"ticket_id": ticket_id})
                 yield f"event: error\ndata: {json.dumps({'message': 'Ticket processing failed. Please try again.'})}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/tickets/{ticket_id}")
     def get_ticket(ticket_id: str):
-        g = get_graph()
-        snap = g.get_state(cfg(ticket_id))
-        if not snap.values:
-            raise HTTPException(404, "Ticket not found")
-        pending = snap.tasks[0].interrupts[0].value if snap.next and snap.tasks and snap.tasks[0].interrupts else None
-        values = dict(snap.values)
-        info = holder["tickets"].get(ticket_id, {})
-        return {**_shape(ticket_id, values, pending), "message": info.get("message", values.get("message", "")), "email": info.get("email", values.get("customer_email", "")), "steps": info.get("steps", []), "policy_result": values.get("policy_result"), "decision": values.get("decision"), "order": values.get("order"), "created_at": info.get("created_at"), "resolved_at": info.get("resolved_at")}
+        with ticket_context(ticket_id):
+            g = get_graph()
+            snap = g.get_state(cfg(ticket_id))
+            if not snap.values:
+                raise HTTPException(404, "Ticket not found")
+            pending = snap.tasks[0].interrupts[0].value if snap.next and snap.tasks and snap.tasks[0].interrupts else None
+            values = dict(snap.values)
+            info = holder["tickets"].get(ticket_id, {})
+            logger.info("Ticket detail requested")
+            return {**_shape(ticket_id, values, pending), "message": info.get("message", values.get("message", "")), "email": info.get("email", values.get("customer_email", "")), "steps": info.get("steps", []), "policy_result": values.get("policy_result"), "decision": values.get("decision"), "order": values.get("order"), "created_at": info.get("created_at"), "resolved_at": info.get("resolved_at")}
 
     @app.post("/tickets/{ticket_id}/approval")
     def decide_approval(ticket_id: str, body: ApprovalIn):
-        g = get_graph()
-        snap = g.get_state(cfg(ticket_id))
-        if not snap.values:
-            raise HTTPException(404, "Ticket not found")
-        if not snap.next:
-            raise HTTPException(409, "This ticket is not waiting for approval")
-        result = g.invoke(Command(resume=body.decision), cfg(ticket_id))
-        pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
-        values = current_values(g, ticket_id, result)
-        if pending:
-            values["approval"] = "pending"
-        remember(ticket_id, values)
+        with ticket_context(ticket_id):
+            g = get_graph()
+            snap = g.get_state(cfg(ticket_id))
+            if not snap.values:
+                raise HTTPException(404, "Ticket not found")
+            if not snap.next:
+                raise HTTPException(409, "This ticket is not waiting for approval")
+            result = g.invoke(Command(resume=body.decision), cfg(ticket_id))
+            pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
+            values = current_values(g, ticket_id, result)
+            if pending:
+                values["approval"] = "pending"
+            remember(ticket_id, values)
+            logger.info("Approval decision recorded", extra={"approval_decision": body.decision})
         return _shape(ticket_id, result, pending)
 
     @app.get("/agent/approvals")

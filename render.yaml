@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: support-agent
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /ready
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: support-agent-db
+          property: connectionString
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MAIN_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: LOG_LEVEL
+        value: INFO
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: AUDIT_PATH
+        value: /var/lib/support-agent/audit.jsonl
+      - key: REFUND_WINDOW_DAYS
+        value: "30"
+      - key: REFUND_AUTO_LIMIT
+        value: "2000"
+      - key: MAX_LOOPS
+        value: "2"
+    disk:
+      name: support-agent-audit
+      mountPath: /var/lib/support-agent
+      sizeGB: 1
+
+databases:
+  - name: support-agent-db
+    databaseName: support_agent
+    user: support_agent
+    plan: 0.5c-1g
+    region: oregon
+    postgresMajorVersion: "16"

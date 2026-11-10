@@ -115,7 +115,7 @@ python -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # Set up environment variables
 cp .env.example .env
@@ -167,11 +167,16 @@ Open **http://127.0.0.1:8000** for the interactive demo UI.
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/tickets` | Submit a new support ticket (`message`, `email`) |
+| `POST` | `/tickets/stream` | Submit a ticket and stream graph progress as server-sent events |
+| `GET` | `/tickets` | List tickets in the current process |
 | `GET` | `/tickets/{id}` | Get ticket status and details |
 | `POST` | `/tickets/{id}/approval` | Approve or reject a pending action (`decision`: `approve`/`reject`) |
+| `GET` | `/agent/approvals` | List tickets awaiting human approval |
+| `GET` | `/analytics` | Get session resolution and approval metrics |
 | `GET` | `/demo/orders` | List all mock orders |
 | `POST` | `/demo/reset` | Reset mock order data to defaults |
 | `GET` | `/health` | Health check |
+| `GET` | `/ready` | Readiness check (requires a reachable Postgres database) |
 | `GET` | `/docs` | Interactive Swagger/OpenAPI docs |
 
 #### Example: Submit a ticket
@@ -217,6 +222,8 @@ On **Windows PowerShell**:
 $env:PYTHONPATH="src"
 pytest -q
 ```
+
+For deployment, Docker Compose, and the Render Blueprint instructions, see [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 ### Eval Suite (requires API keys)
 

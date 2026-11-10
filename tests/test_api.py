@@ -1,3 +1,5 @@
+import json
+import logging
 import sys
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
 from support_agent import tools  # noqa: E402
 from support_agent.api import create_app  # noqa: E402
 from support_agent.graph import build_graph  # noqa: E402
+from support_agent.logging_config import JsonFormatter, ticket_context  # noqa: E402
 
 
 @pytest.fixture()
@@ -26,6 +29,28 @@ def test_health_and_index(client):
     assert client.get("/health").json() == {"ok": True}
     r = client.get("/")
     assert r.status_code == 200 and "Support Resolution Agent" in r.text
+
+
+def test_readiness_requires_database(client, monkeypatch):
+    monkeypatch.setattr("support_agent.api.database_ready", lambda: True)
+    assert client.get("/ready").json() == {"ok": True, "database": "ready"}
+
+    monkeypatch.setattr("support_agent.api.database_ready", lambda: False)
+    response = client.get("/ready")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Database unavailable"
+
+
+def test_json_logs_always_include_ticket_id():
+    formatter = JsonFormatter()
+    record = logging.makeLogRecord({"name": "support_agent.test", "msg": "step completed", "levelno": logging.INFO, "levelname": "INFO"})
+    with ticket_context("T-test01"):
+        entry = json.loads(formatter.format(record))
+    assert entry["ticket_id"] == "T-test01"
+    assert entry["message"] == "step completed"
+
+    system_entry = json.loads(formatter.format(record))
+    assert system_entry["ticket_id"] == "system"
 
 
 def test_small_refund_resolves(client):
