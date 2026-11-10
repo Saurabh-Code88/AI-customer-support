@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support Resolution Agent</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--text:#1b1f24;--muted:#667085;--line:#e4e7ec;--accent:#2f5bea;
+        --green:#15803d;--amber:#b45309;--red:#b42318;--blue:#1d4ed8;color-scheme:light dark}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--text:#e8eaed;--muted:#9aa3af;
+        --line:#2a2f38;--accent:#6b8cff;--green:#4ade80;--amber:#fbbf24;--red:#f87171;--blue:#8ab4ff}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{padding:18px 24px;border-bottom:1px solid var(--line);background:var(--card)}
+  header h1{margin:0;font-size:18px} header p{margin:2px 0 0;color:var(--muted);font-size:13px}
+  main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:20px;max-width:1100px;margin:20px auto;padding:0 20px}
+  @media (max-width:820px){main{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+  h2{margin:0 0 10px;font-size:14px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--text);font:inherit}
+  textarea{min-height:90px;resize:vertical}
+  button{font:inherit;padding:9px 14px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--text);cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 4px;border-bottom:1px solid var(--line)}
+  tbody tr{cursor:pointer} tbody tr:hover{background:rgba(127,127,127,.1)}
+  .badge{display:inline-block;padding:2px 10px;border-radius:999px;border:1px solid currentColor;font-size:12px;font-weight:600}
+  .resolved{color:var(--green)} .needs_info{color:var(--amber)} .escalated{color:var(--red)} .pending_approval{color:var(--blue)}
+  .reply{margin:10px 0;padding:10px 12px;border-left:3px solid var(--accent);background:rgba(127,127,127,.08);border-radius:4px;white-space:pre-wrap}
+  ol{margin:6px 0 0;padding-left:20px;font-size:13px;color:var(--muted)} li{margin:2px 0;word-break:break-word}
+  .muted{color:var(--muted);font-size:13px} .error{color:var(--red);font-size:13px;margin-top:8px}
+  .hist div{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid var(--line);font-size:13px;cursor:pointer}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>Support Resolution Agent</h1>
+  <p>LangGraph · Gemini + Groq · demo with mock orders</p>
+</header>
+<main>
+  <section>
+    <div class="card">
+      <h2>New ticket</h2>
+      <label for="email">Customer email</label>
+      <input id="email" value="a@example.com" autocomplete="off">
+      <label for="message">Message</label>
+      <textarea id="message" placeholder="e.g. Please refund order A1001"></textarea>
+      <div class="row">
+        <button id="send" class="primary">Send ticket</button>
+        <button id="reset" title="Reset mock orders to their starting state">Reset demo data</button>
+      </div>
+      <div id="formError" class="error"></div>
+    </div>
+    <div class="card">
+      <h2>Demo orders (click a row to use it)</h2>
+      <table>
+        <thead><tr><th>Order</th><th>Email</th><th>Status</th><th>Total</th><th>Refunded</th></tr></thead>
+        <tbody id="orders"></tbody>
+      </table>
+    </div>
+  </section>
+  <section>
+    <div class="card">
+      <h2>Agent result</h2>
+      <div id="empty" class="muted">Send a ticket to see the agent's reply and every step it took.</div>
+      <div id="result" class="hidden">
+        <div><span id="badge" class="badge"></span> <span id="tid" class="muted"></span></div>
+        <div id="reply" class="reply"></div>
+        <div id="approval" class="hidden">
+          <div><strong>Human approval needed</strong></div>
+          <div id="approvalText" class="muted"></div>
+          <div class="row">
+            <button id="approve" class="primary">Approve</button>
+            <button id="reject">Reject</button>
+          </div>
+        </div>
+        <h2 style="margin-top:14px">Audit trail</h2>
+        <ol id="audit"></ol>
+      </div>
+    </div>
+    <div class="card">
+      <h2>This session</h2>
+      <div id="history" class="hist muted">No tickets yet.</div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const sessionTickets = [];
+let current = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const d = data.detail;
+    throw new Error(typeof d === "string" ? d : (r.status + " " + r.statusText));
+  }
+  return data;
+}
+
+function post(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+async function loadOrders() {
+  const orders = await api("/demo/orders");
+  const tbody = $("orders");
+  tbody.textContent = "";
+  for (const o of orders) {
+    const tr = document.createElement("tr");
+    for (const v of [o.order_id, o.customer_email, o.status, o.total, o.refunded]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    tr.addEventListener("click", () => {
+      $("email").value = o.customer_email;
+      const m = $("message");
+      if (!m.value.trim()) m.value = "Where is my order " + o.order_id + "?";
+      else if (!m.value.includes(o.order_id)) m.value += " (order " + o.order_id + ")";
+    });
+    tbody.appendChild(tr);
+  }
+}
+
+function show(t) {
+  current = t;
+  $("empty").classList.add("hidden");
+  $("result").classList.remove("hidden");
+  const badge = $("badge");
+  badge.textContent = (t.status || "unknown").replace("_", " ");
+  badge.className = "badge " + (t.status || "");
+  $("tid").textContent = t.ticket_id;
+  $("reply").textContent = t.reply || (t.status === "pending_approval" ? "Waiting for a human decision..." : "");
+  const ap = $("approval");
+  if (t.approval) {
+    const a = t.approval.proposed_action || {};
+    $("approvalText").textContent =
+      "Proposed: " + (a.tool_name || "action") + " on " + (a.order_id || "?") + ". Reason: " + (t.approval.reason || "");
+    ap.classList.remove("hidden");
+  } else {
+    ap.classList.add("hidden");
+  }
+  const ol = $("audit");
+  ol.textContent = "";
+  for (const line of t.audit || []) {
+    const li = document.createElement("li");
+    li.textContent = line;
+    ol.appendChild(li);
+  }
+  renderHistory(t);
+}
+
+function renderHistory(t) {
+  const i = sessionTickets.findIndex((x) => x.ticket_id === t.ticket_id);
+  if (i >= 0) sessionTickets[i] = t; else sessionTickets.unshift(t);
+  const box = $("history");
+  box.textContent = "";
+  for (const s of sessionTickets) {
+    const row = document.createElement("div");
+    const left = document.createElement("span");
+    left.textContent = s.ticket_id;
+    const right = document.createElement("span");
+    right.textContent = (s.status || "").replace("_", " ");
+    right.className = s.status || "";
+    row.append(left, right);
+    row.addEventListener("click", () => show(s));
+    box.appendChild(row);
+  }
+}
+
+function setBusy(busy) {
+  for (const id of ["send", "approve", "reject"]) $(id).disabled = busy;
+  $("send").textContent = busy ? "Working..." : "Send ticket";
+}
+
+$("send").addEventListener("click", async () => {
+  $("formError").textContent = "";
+  setBusy(true);
+  try {
+    const t = await post("/tickets", { message: $("message").value, email: $("email").value });
+    show(t);
+    await loadOrders();
+  } catch (e) {
+    $("formError").textContent = e.message;
+  } finally {
+    setBusy(false);
+  }
+});
+
+for (const [id, decision] of [["approve", "approve"], ["reject", "reject"]]) {
+  $(id).addEventListener("click", async () => {
+    if (!current) return;
+    setBusy(true);
+    try {
+      show(await post("/tickets/" + current.ticket_id + "/approval", { decision }));
+      await loadOrders();
+    } catch (e) {
+      $("formError").textContent = e.message;
+    } finally {
+      setBusy(false);
+    }
+  });
+}
+
+$("reset").addEventListener("click", async () => {
+  try { await post("/demo/reset", {}); await loadOrders(); } catch (e) { $("formError").textContent = e.message; }
+});
+
+loadOrders().catch((e) => { $("formError").textContent = e.message; });
+</script>
+</body>
+</html>
