@@ -1,6 +1,7 @@
 import json
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -80,11 +81,68 @@ def test_large_refund_reject_escalates(client):
     assert tools.ORDERS["A1002"]["refunded"] == 0
 
 
-def test_approval_errors(client):
-    assert client.post("/tickets/T-nope/approval", json={"decision": "approve"}).status_code == 404
-    assert client.get("/tickets/T-nope").status_code == 404
-    tid = client.post("/tickets", json={"message": "Please refund order A1001", "email": "a@example.com"}).json()["ticket_id"]
-    assert client.post(f"/tickets/{tid}/approval", json={"decision": "approve"}).status_code == 409
+def test_approval_unknown_ticket_returns_consistent_404(client):
+    response = client.post("/tickets/T-nope/approval", json={"decision": "approve"})
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {"code": "ticket_not_found", "message": "Ticket not found"}
+    }
+
+
+def test_approval_for_resolved_ticket_returns_consistent_409(client):
+    ticket = client.post(
+        "/tickets",
+        json={"message": "Please refund order A1001", "email": "a@example.com"},
+    ).json()
+
+    response = client.post(
+        f"/tickets/{ticket['ticket_id']}/approval", json={"decision": "approve"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "approval_not_pending",
+            "message": "Ticket is not awaiting approval",
+        }
+    }
+
+
+def test_double_approval_is_rejected(client):
+    ticket = client.post(
+        "/tickets",
+        json={"message": "Please refund order A1002", "email": "b@example.com"},
+    ).json()
+    url = f"/tickets/{ticket['ticket_id']}/approval"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(
+            pool.map(
+                lambda _: client.post(url, json={"decision": "approve"}),
+                range(2),
+            )
+        )
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["error"]["code"] == "approval_not_pending"
+    assert tools.ORDERS["A1002"]["refunded"] == 5999.0
+
+
+def test_approve_then_reject_is_rejected(client):
+    ticket = client.post(
+        "/tickets",
+        json={"message": "Please refund order A1002", "email": "b@example.com"},
+    ).json()
+    url = f"/tickets/{ticket['ticket_id']}/approval"
+
+    assert client.post(url, json={"decision": "approve"}).status_code == 200
+    response = client.post(url, json={"decision": "reject"})
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "approval_not_pending"
+    assert tools.ORDERS["A1002"]["refunded"] == 5999.0
 
 
 def test_validation_and_demo(client):

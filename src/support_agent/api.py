@@ -7,10 +7,11 @@ import json
 import time
 import uuid
 from pathlib import Path
+from threading import Lock
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -43,10 +44,17 @@ def _shape(ticket_id: str, values: dict, pending_payload=None) -> dict:
     }
 
 
+def _approval_error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
 def create_app(graph=None) -> FastAPI:
     """Pass a prebuilt graph for tests. Otherwise the real graph is built on first use."""
     app = FastAPI(title="Support Resolution Agent")
-    holder = {"graph": graph, "tickets": {}}
+    holder = {"graph": graph, "tickets": {}, "approval_locks": {}, "approval_locks_guard": Lock()}
 
     def get_graph():
         if holder["graph"] is None:
@@ -61,6 +69,10 @@ def create_app(graph=None) -> FastAPI:
 
     def cfg(ticket_id: str):
         return {"configurable": {"thread_id": ticket_id}}
+
+    def approval_lock(ticket_id: str):
+        with holder["approval_locks_guard"]:
+            return holder["approval_locks"].setdefault(ticket_id, Lock())
 
     def remember(ticket_id: str, values: dict, *, created_at=None, steps=None):
         prior = holder["tickets"].get(ticket_id, {})
@@ -171,20 +183,31 @@ def create_app(graph=None) -> FastAPI:
 
     @app.post("/tickets/{ticket_id}/approval")
     def decide_approval(ticket_id: str, body: ApprovalIn):
-        with ticket_context(ticket_id):
-            g = get_graph()
-            snap = g.get_state(cfg(ticket_id))
-            if not snap.values:
-                raise HTTPException(404, "Ticket not found")
-            if not snap.next:
-                raise HTTPException(409, "This ticket is not waiting for approval")
-            result = g.invoke(Command(resume=body.decision), cfg(ticket_id))
-            pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
-            values = current_values(g, ticket_id, result)
-            if pending:
-                values["approval"] = "pending"
-            remember(ticket_id, values)
-            logger.info("Approval decision recorded", extra={"approval_decision": body.decision})
+        with approval_lock(ticket_id):
+            info = holder["tickets"].get(ticket_id)
+            if info is None:
+                return _approval_error(404, "ticket_not_found", "Ticket not found")
+            if info.get("status") != "pending_approval":
+                return _approval_error(409, "approval_not_pending", "Ticket is not awaiting approval")
+
+            with ticket_context(ticket_id):
+                g = get_graph()
+                snap = g.get_state(cfg(ticket_id))
+                awaiting_interrupt = bool(
+                    snap.next
+                    and snap.tasks
+                    and snap.tasks[0].interrupts
+                )
+                if not awaiting_interrupt:
+                    return _approval_error(409, "approval_not_pending", "Ticket is not awaiting approval")
+
+                result = g.invoke(Command(resume=body.decision), cfg(ticket_id))
+                pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
+                values = current_values(g, ticket_id, result)
+                if pending:
+                    values["approval"] = "pending"
+                remember(ticket_id, values)
+                logger.info("Approval decision recorded", extra={"approval_decision": body.decision})
         return _shape(ticket_id, result, pending)
 
     @app.get("/agent/approvals")
