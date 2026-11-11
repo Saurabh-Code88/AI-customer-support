@@ -23,12 +23,13 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://support_agent:local_support_password@db:5432/support_agent}
-      DATABASE_PATH: /var/lib/support-agent/support_agent.db
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-support_agent}:${POSTGRES_PASSWORD:-local_support_password}@db:5432/${POSTGRES_DB:-support_agent}}
+      DATABASE_PATH: ${DATABASE_PATH:-/var/lib/support-agent/support_agent.db}
       DATABASE_CONNECT_TIMEOUT: ${DATABASE_CONNECT_TIMEOUT:-3}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-local-only-change-me-use-a-random-secret}
+      SESSION_TOKEN_TTL_SECONDS: ${SESSION_TOKEN_TTL_SECONDS:-1800}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
       MAIN_PROVIDER: ${MAIN_PROVIDER:-gemini}

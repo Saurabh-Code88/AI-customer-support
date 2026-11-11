@@ -231,7 +231,7 @@ $env:PYTHONPATH="src"
 pytest -q
 ```
 
-For deployment, Docker Compose, and the Render Blueprint instructions, see [DEPLOYMENT.md](./DEPLOYMENT.md).
+For Docker Compose and platform-neutral container deployment instructions, see [DEPLOY.md](./DEPLOY.md).
 
 ### Eval Suite (requires API keys)
 
