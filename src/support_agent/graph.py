@@ -142,6 +142,7 @@ def build_graph(fast, main, checkpointer=None):
             result = T.run_tool(
                 d["tool_name"],
                 order_id=d.get("order_id") or s.get("order_id"),
+                ticket_id=s.get("ticket_id"),
                 amount=d.get("amount"),
                 new_address=d.get("new_address"),
             )

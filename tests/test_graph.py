@@ -69,3 +69,32 @@ def test_wrong_clarify_is_retried(tmp_path, monkeypatch):
     out = run_ticket(graph, "Please refund order A1001.", "a@example.com")
     assert out["resolution"] == "resolved"
     assert flaky.calls == 2
+
+
+def test_refund_retry_after_lost_tool_response_applies_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("support_agent.graph.AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    tools.reset()
+    original_run_tool = tools.run_tool
+    calls = 0
+
+    def lose_first_refund_response(name, **kwargs):
+        nonlocal calls
+        result = original_run_tool(name, **kwargs)
+        if name == "issue_refund":
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("refund succeeded but response was lost")
+        return result
+
+    monkeypatch.setattr("support_agent.graph.T.run_tool", lose_first_refund_response)
+    graph = build_graph(FakeLLM(), FakeLLM(), MemorySaver())
+    out = run_ticket(
+        graph,
+        "Please refund order A1001.",
+        "a@example.com",
+        ticket_id="T-retry01",
+    )
+
+    assert out["resolution"] == "resolved"
+    assert calls == 2
+    assert tools.ORDERS["A1001"]["refunded"] == 1499.0
