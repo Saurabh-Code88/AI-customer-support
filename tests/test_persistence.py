@@ -17,6 +17,12 @@ from support_agent.database import (  # noqa: E402
 )
 from support_agent.api import create_app  # noqa: E402
 from support_agent.graph import build_graph  # noqa: E402
+from support_agent.auth import issue_token  # noqa: E402
+
+
+def headers(role, email=None):
+    token, _ = issue_token(role, email)
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_refund_idempotency_survives_database_reconfiguration():
@@ -36,7 +42,8 @@ def test_pending_approval_survives_checkpointer_reopen():
         with TestClient(create_app(first_graph)) as client:
             created = client.post(
                 "/tickets",
-                json={"message": "Please refund order A1002.", "email": "b@example.com"},
+                json={"message": "Please refund order A1002."},
+                headers=headers("customer", "b@example.com"),
             )
             assert created.status_code == 200
             ticket_id = created.json()["ticket_id"]
@@ -45,11 +52,11 @@ def test_pending_approval_survives_checkpointer_reopen():
     with checkpointer_context() as reopened_checkpointer:
         resumed_graph = build_graph(FakeLLM(), FakeLLM(), reopened_checkpointer)
         with TestClient(create_app(resumed_graph)) as client:
-            detail = client.get(f"/tickets/{ticket_id}")
+            detail = client.get(f"/tickets/{ticket_id}", headers=headers("customer", "b@example.com"))
             assert detail.status_code == 200
             assert detail.json()["status"] == "pending_approval"
             completed = client.post(
-                f"/tickets/{ticket_id}/approval", json={"decision": "approve"}
+                f"/tickets/{ticket_id}/approval", json={"decision": "approve"}, headers=headers("agent")
             )
 
     assert completed.status_code == 200

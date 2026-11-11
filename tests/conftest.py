@@ -1,4 +1,7 @@
 import pytest
+import os
+
+os.environ.setdefault("AUTH_JWT_SECRET", "test-secret-for-support-agent-session-tokens")
 
 from support_agent.database import checkpointer_context, configure_database, run_migrations
 from support_agent.seed import seed_orders

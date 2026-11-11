@@ -21,6 +21,7 @@ DATABASE_CONNECT_TIMEOUT = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "3"))
 PORT = int(os.getenv("PORT", "8000"))
 WEB_CONCURRENCY = int(os.getenv("WEB_CONCURRENCY", "1"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+APP_ENV = os.getenv("APP_ENV", "development").lower()
 
 # Business rules (enforced in plain code, never by the LLM)
 REFUND_WINDOW_DAYS = int(os.getenv("REFUND_WINDOW_DAYS", "30"))

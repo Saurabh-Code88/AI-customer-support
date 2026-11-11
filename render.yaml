@@ -12,6 +12,10 @@ services:
         fromDatabase:
           name: support-agent-db
           property: connectionString
+      - key: APP_ENV
+        value: production
+      - key: AUTH_JWT_SECRET
+        sync: false
       - key: GOOGLE_API_KEY
         sync: false
       - key: GROQ_API_KEY

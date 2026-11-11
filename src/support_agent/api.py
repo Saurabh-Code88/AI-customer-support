@@ -14,7 +14,7 @@ from typing import Literal
 # Load env and strict checkpoint settings before importing LangGraph modules.
 from .config import LANGGRAPH_STRICT_MSGPACK as _strict_msgpack  # noqa: F401
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -23,14 +23,20 @@ from . import tools
 from . import database
 from .database import database_ready
 from .logging_config import configure_logging, ticket_context
+from .auth import Principal, issue_token, require_principal, require_role, validate_auth_configuration
 
 STATIC = Path(__file__).parent / "static"
 logger = configure_logging()
 
 
 class TicketIn(BaseModel):
+    model_config = {"extra": "forbid"}
     message: str = Field(min_length=3, max_length=2000)
-    email: str = Field(min_length=3, max_length=200)
+
+
+class SessionIn(BaseModel):
+    role: Literal["customer", "agent"]
+    customer_email: str | None = Field(default=None, min_length=3, max_length=200)
 
 
 class ApprovalIn(BaseModel):
@@ -66,6 +72,7 @@ def create_app(graph=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app):
+        validate_auth_configuration()
         database.run_migrations()
         from .seed import seed_orders
 
@@ -131,32 +138,49 @@ def create_app(graph=None) -> FastAPI:
             raise HTTPException(status_code=503, detail="Database unavailable")
         return {"ok": True, "database": "ready"}
 
+    @app.get("/auth/customers")
+    def auth_customers():
+        return sorted({order["customer_email"] for order in tools.list_orders()})
+
+    @app.post("/auth/session")
+    def create_session(body: SessionIn):
+        email = None
+        if body.role == "customer":
+            email = (body.customer_email or "").strip().lower()
+            if not any(order["customer_email"].lower() == email for order in tools.list_orders()):
+                raise HTTPException(422, detail={"code": "unknown_customer", "message": "Choose one of the demo customers."})
+        elif body.customer_email:
+            raise HTTPException(422, detail={"code": "invalid_session", "message": "A support agent session does not use a customer email."})
+        token, ttl = issue_token(body.role, email)
+        return {"access_token": token, "token_type": "bearer", "expires_in": ttl, "role": body.role, "email": email}
+
     @app.get("/")
     def index():
         return FileResponse(STATIC / "index.html")
 
     @app.post("/tickets")
-    def create_ticket(body: TicketIn):
+    def create_ticket(body: TicketIn, principal: Principal = Depends(require_role("customer"))):
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
-        database.create_ticket(ticket_id, body.message.strip(), body.email.strip())
+        email = principal.email
+        database.create_ticket(ticket_id, body.message.strip(), email)
         with ticket_context(ticket_id):
             logger.info("Ticket processing started")
             g = get_graph()
             result = g.invoke(
-                {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": body.email.strip()},
+                {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": email},
                 cfg(ticket_id),
             )
             pending = result["__interrupt__"][0].value if "__interrupt__" in result else None
-            remember(ticket_id, {**result, "message": body.message.strip(), "customer_email": body.email.strip(), "approval": "pending" if pending else result.get("approval")}, created_at=created_at)
+            remember(ticket_id, {**result, "message": body.message.strip(), "customer_email": email, "approval": "pending" if pending else result.get("approval")}, created_at=created_at)
             logger.info("Ticket processing paused for approval" if pending else "Ticket processing completed")
         return _shape(ticket_id, result, pending)
 
     @app.post("/tickets/stream")
-    def create_ticket_stream(body: TicketIn):
+    def create_ticket_stream(body: TicketIn, principal: Principal = Depends(require_role("customer"))):
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
-        initial = {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": body.email.strip()}
+        initial = {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": principal.email}
         database.create_ticket(ticket_id, initial["message"], initial["customer_email"])
         g = get_graph()
 
@@ -191,9 +215,11 @@ def create_app(graph=None) -> FastAPI:
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/tickets/{ticket_id}")
-    def get_ticket(ticket_id: str):
+    def get_ticket(ticket_id: str, principal: Principal = Depends(require_principal)):
         info = database.get_ticket(ticket_id)
         if info is None:
+            raise HTTPException(404, "Ticket not found")
+        if principal.role == "customer" and info["email"].lower() != (principal.email or "").lower():
             raise HTTPException(404, "Ticket not found")
         with ticket_context(ticket_id):
             g = get_graph()
@@ -205,7 +231,7 @@ def create_app(graph=None) -> FastAPI:
             return {**_shape(ticket_id, values, pending), "message": info["message"], "email": info["email"], "steps": info["steps"], "policy_result": values.get("policy_result"), "decision": values.get("decision"), "order": values.get("order"), "created_at": info["created_at"], "resolved_at": info["resolved_at"]}
 
     @app.post("/tickets/{ticket_id}/approval")
-    def decide_approval(ticket_id: str, body: ApprovalIn):
+    def decide_approval(ticket_id: str, body: ApprovalIn, _principal: Principal = Depends(require_role("agent"))):
         with approval_lock(ticket_id):
             info = database.get_ticket(ticket_id)
             if info is None:
@@ -234,7 +260,7 @@ def create_app(graph=None) -> FastAPI:
         return _shape(ticket_id, result, pending)
 
     @app.get("/agent/approvals")
-    def approval_queue():
+    def approval_queue(_principal: Principal = Depends(require_role("agent"))):
         items = []
         for info in database.list_tickets(status="pending_approval"):
             values = info["values"]
@@ -243,16 +269,19 @@ def create_app(graph=None) -> FastAPI:
         return items
 
     @app.get("/tickets")
-    def list_tickets():
-        return [{"ticket_id": x["ticket_id"], "message": x["message"], "email": x["email"], "status": x["status"], "created_at": x["created_at"]} for x in database.list_tickets()]
+    def list_tickets(principal: Principal = Depends(require_principal)):
+        records = database.list_tickets()
+        if principal.role == "customer":
+            records = [x for x in records if x["email"].lower() == (principal.email or "").lower()]
+        return [{"ticket_id": x["ticket_id"], "message": x["message"], "email": x["email"], "status": x["status"], "created_at": x["created_at"]} for x in records]
 
     @app.get("/analytics")
-    def analytics():
+    def analytics(_principal: Principal = Depends(require_role("agent"))):
         return database.analytics()
 
     # ---- demo helpers (mock data only) ----
     @app.get("/demo/orders")
-    def demo_orders():
+    def demo_orders(_principal: Principal = Depends(require_role("agent"))):
         return [
             {
                 key: order[key]
@@ -262,7 +291,7 @@ def create_app(graph=None) -> FastAPI:
         ]
 
     @app.post("/demo/reset")
-    def demo_reset():
+    def demo_reset(_principal: Principal = Depends(require_role("agent"))):
         tools.reset()
         return {"ok": True}
 
