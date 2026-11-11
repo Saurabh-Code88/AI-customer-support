@@ -17,7 +17,8 @@ An AI-powered customer support agent built with **LangGraph**, **Google Gemini**
 | **Prompt injection resistance** | System-level guardrails ignore embedded instructions, role claims, and social engineering |
 | **Multi-order detection** | Automatically escalates tickets mentioning multiple orders |
 | **Identity verification** | Customer email must match the order's email — enforced deterministically |
-| **Audit trail** | Every step is logged to `audit.jsonl` with structured records |
+| **Persistent data** | SQLAlchemy stores orders, tickets, refund idempotency records, and ordered audit events |
+| **Persistent graph state** | SQLite locally and Postgres in deployment keep approval interrupts resumable |
 | **Web UI + REST API** | FastAPI backend with a built-in single-page demo UI |
 | **Offline tests** | Full test suite runs with a rule-based `FakeLLM` — no API keys needed |
 | **Eval suite** | 19 test tickets covering edge cases, adversarial prompts, and partial refunds |
@@ -72,7 +73,10 @@ support-agent/
 │   ├── policy.py           # Deterministic guardrails (the LLM proposes, this code disposes)
 │   ├── retrieval.py        # Stub RAG — policy lookup by intent
 │   ├── schemas.py          # Pydantic models for Classification and Decision
-│   ├── tools.py            # Mock backend (orders, refunds, address updates)
+│   ├── tools.py            # Database-backed order, refund, and address tools
+│   ├── models.py           # SQLAlchemy persistence models
+│   ├── database.py         # Database, migration, and checkpointer setup
+│   ├── seed.py             # Seed the five demo orders
 │   ├── policies.md         # Support policy text (retrieved per intent)
 │   └── static/
 │       └── index.html      # Single-page demo UI
@@ -85,7 +89,8 @@ support-agent/
 │   └── run_evals.py        # Runs evals against real models
 ├── .env.example            # Environment variable template
 ├── requirements.txt        # Python dependencies
-└── audit.jsonl             # Audit log (generated at runtime)
+├── alembic/                # Database migrations
+└── alembic.ini
 ```
 
 ---
@@ -131,7 +136,10 @@ cp .env.example .env
 | `GEMINI_MODEL` | ❌ | `gemini-2.5-flash` | Gemini model name |
 | `GROQ_MODEL` | ❌ | `openai/gpt-oss-120b` | Groq model name |
 | `MAIN_PROVIDER` | ❌ | `gemini` | Main reasoning LLM provider (`gemini` or `groq`) |
-| `AUDIT_PATH` | ❌ | `audit.jsonl` | Path to the audit log file |
+| `DATABASE_URL` | ❌ | empty | PostgreSQL URL; when empty, SQLite uses `DATABASE_PATH` |
+| `DATABASE_PATH` | ❌ | `./support_agent.db` | SQLite data and local graph checkpoint file |
+| `DATABASE_CONNECT_TIMEOUT` | ❌ | `3` | Database readiness timeout in seconds |
+| `LANGGRAPH_STRICT_MSGPACK` | ❌ | `true` | Restrict checkpoint deserialization to safe MessagePack types |
 
 ---
 
@@ -168,7 +176,7 @@ Open **http://127.0.0.1:8000** for the interactive demo UI.
 |---|---|---|
 | `POST` | `/tickets` | Submit a new support ticket (`message`, `email`) |
 | `POST` | `/tickets/stream` | Submit a ticket and stream graph progress as server-sent events |
-| `GET` | `/tickets` | List tickets in the current process |
+| `GET` | `/tickets` | List persisted tickets |
 | `GET` | `/tickets/{id}` | Get ticket status and details |
 | `POST` | `/tickets/{id}/approval` | Approve or reject a pending action (`decision`: `approve`/`reject`) |
 | `GET` | `/agent/approvals` | List tickets awaiting human approval |
@@ -176,7 +184,7 @@ Open **http://127.0.0.1:8000** for the interactive demo UI.
 | `GET` | `/demo/orders` | List all mock orders |
 | `POST` | `/demo/reset` | Reset mock order data to defaults |
 | `GET` | `/health` | Health check |
-| `GET` | `/ready` | Readiness check (requires a reachable Postgres database) |
+| `GET` | `/ready` | Readiness check (requires the configured database) |
 | `GET` | `/docs` | Interactive Swagger/OpenAPI docs |
 
 #### Example: Submit a ticket
@@ -282,11 +290,11 @@ The project is designed to be production-ready in architecture, with swappable s
 
 | Component | Current (stub) | Production swap |
 |---|---|---|
-| Order backend | In-memory `_ORDERS` dict | Real orders API / database |
+| Order backend | SQLAlchemy-seeded demo orders | Real orders API / database |
 | Policy retrieval | `policies.md` section lookup | Vector store (Chroma, pgvector) |
-| Checkpointer | `MemorySaver` (in-memory) | SQLite / Postgres checkpointer |
+| Checkpointer | SQLite locally / Postgres in deployment | Shared distributed production database |
 | Auth | None (email in request body) | OAuth / API keys |
-| Audit log | Append-only JSONL file | Structured logging / observability platform |
+| Audit trail | Ordered `audit_events` database records | Structured logging / observability platform |
 
 ---
 

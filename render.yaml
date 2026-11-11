@@ -26,19 +26,14 @@ services:
         value: INFO
       - key: WEB_CONCURRENCY
         value: "1"
-      - key: AUDIT_PATH
-        value: /var/lib/support-agent/audit.jsonl
+      - key: LANGGRAPH_STRICT_MSGPACK
+        value: "true"
       - key: REFUND_WINDOW_DAYS
         value: "30"
       - key: REFUND_AUTO_LIMIT
         value: "2000"
       - key: MAX_LOOPS
         value: "2"
-    disk:
-      name: support-agent-audit
-      mountPath: /var/lib/support-agent
-      sizeGB: 1
-
 databases:
   - name: support-agent-db
     databaseName: support_agent

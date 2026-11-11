@@ -11,7 +11,6 @@ sys.path.insert(0, str(ROOT / "tests"))
 import pytest  # noqa: E402
 from fake_llm import FakeLLM  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
 
 from support_agent import tools  # noqa: E402
 from support_agent.api import create_app  # noqa: E402
@@ -20,10 +19,9 @@ from support_agent.logging_config import JsonFormatter, ticket_context  # noqa: 
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.setattr("support_agent.graph.AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+def client(checkpointer):
     tools.reset()
-    return TestClient(create_app(build_graph(FakeLLM(), FakeLLM(), MemorySaver())))
+    return TestClient(create_app(build_graph(FakeLLM(), FakeLLM(), checkpointer)))
 
 
 def test_health_and_index(client):
@@ -71,14 +69,14 @@ def test_large_refund_needs_approval_then_approve(client):
     assert client.get(f"/tickets/{tid}").json()["status"] == "pending_approval"
     done = client.post(f"/tickets/{tid}/approval", json={"decision": "approve"}).json()
     assert done["status"] == "resolved"
-    assert tools.ORDERS["A1002"]["refunded"] == 5999.0
+    assert tools.get_order("A1002")["refunded"] == 5999.0
 
 
 def test_large_refund_reject_escalates(client):
     tid = client.post("/tickets", json={"message": "Please refund order A1002", "email": "b@example.com"}).json()["ticket_id"]
     done = client.post(f"/tickets/{tid}/approval", json={"decision": "reject"}).json()
     assert done["status"] == "escalated"
-    assert tools.ORDERS["A1002"]["refunded"] == 0
+    assert tools.get_order("A1002")["refunded"] == 0
 
 
 def test_approval_unknown_ticket_returns_consistent_404(client):
@@ -127,7 +125,7 @@ def test_double_approval_is_rejected(client):
     assert sorted(response.status_code for response in responses) == [200, 409]
     conflict = next(response for response in responses if response.status_code == 409)
     assert conflict.json()["error"]["code"] == "approval_not_pending"
-    assert tools.ORDERS["A1002"]["refunded"] == 5999.0
+    assert tools.get_order("A1002")["refunded"] == 5999.0
 
 
 def test_approve_then_reject_is_rejected(client):
@@ -142,14 +140,20 @@ def test_approve_then_reject_is_rejected(client):
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "approval_not_pending"
-    assert tools.ORDERS["A1002"]["refunded"] == 5999.0
+    assert tools.get_order("A1002")["refunded"] == 5999.0
 
 
 def test_validation_and_demo(client):
     assert client.post("/tickets", json={"message": "x", "email": "a@example.com"}).status_code == 422
     assert client.post("/tickets", json={"message": "hello there", "email": ""}).status_code == 422
     assert len(client.get("/demo/orders").json()) == 5
+    tools.issue_refund(order_id="A1001", amount=100, ticket_id="T-demo-reset")
+    tools.update_address(order_id="A1003", new_address="Changed address")
     assert client.post("/demo/reset").json() == {"ok": True}
+    orders = client.get("/demo/orders").json()
+    assert set(orders[0]) == {"order_id", "customer_email", "status", "total", "refunded"}
+    assert next(order for order in orders if order["order_id"] == "A1001")["refunded"] == 0.0
+    assert tools.get_order("A1003")["address"] == "44 Park Street, Kolkata"
 
 
 def test_streaming_ticket_queue_detail_and_analytics(client):

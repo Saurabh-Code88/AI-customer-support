@@ -2,15 +2,16 @@
 import json
 import operator
 import re
-import time
 from typing import Annotated, Optional, TypedDict
+
+from .config import MAX_LOOPS
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from . import policy as P
 from . import tools as T
-from .config import AUDIT_PATH, MAX_LOOPS
+from .database import upsert_ticket
 from .logging_config import configure_logging
 from .retrieval import retrieve_policies
 from .schemas import Classification, Decision
@@ -183,11 +184,15 @@ def build_graph(fast, main, checkpointer=None):
         }
 
     def log(s: State):
-        record = {k: s.get(k) for k in ("ticket_id", "intent", "resolution", "reply", "audit")}
-        record["audit"] = [*s.get("audit", []), "log: audit record written"]
-        record["ts"] = time.time()
-        with open(AUDIT_PATH, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        audit = [*s.get("audit", []), "log: audit record written"]
+        upsert_ticket(
+            s["ticket_id"],
+            s.get("message", ""),
+            s.get("customer_email", ""),
+            status=s["resolution"],
+            values={**s, "audit": audit},
+            audit=audit,
+        )
         logger.info("Ticket audit record written", extra={"ticket_id": s.get("ticket_id")})
         return {"audit": ["log: audit record written"]}
 

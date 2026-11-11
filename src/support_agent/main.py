@@ -2,12 +2,14 @@
 import argparse
 import uuid
 
-from langgraph.checkpoint.memory import MemorySaver
+from .config import get_fast_llm, get_main_llm
+
 from langgraph.types import Command
 
-from .config import get_fast_llm, get_main_llm
+from .database import checkpointer_context, run_migrations
 from .graph import build_graph
 from .logging_config import ticket_context
+from .seed import seed_orders
 
 
 def run_ticket(graph, message: str, email: str, ticket_id: str | None = None, approver=None):
@@ -30,8 +32,11 @@ def main():
     ap.add_argument("message")
     ap.add_argument("--email", required=True)
     args = ap.parse_args()
-    graph = build_graph(get_fast_llm(), get_main_llm(), MemorySaver())
-    out = run_ticket(graph, args.message, args.email)
+    run_migrations()
+    seed_orders()
+    with checkpointer_context() as checkpointer:
+        graph = build_graph(get_fast_llm(), get_main_llm(), checkpointer)
+        out = run_ticket(graph, args.message, args.email)
     print("\nResolution:", out["resolution"])
     print("Reply:", out["reply"])
     print("Audit:")

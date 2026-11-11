@@ -14,7 +14,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     PORT=8000 \
     WEB_CONCURRENCY=1 \
-    AUDIT_PATH=/var/lib/support-agent/audit.jsonl
+    DATABASE_PATH=/var/lib/support-agent/support_agent.db \
+    LANGGRAPH_STRICT_MSGPACK=true
 
 RUN groupadd --gid 10001 support-agent \
     && useradd --uid 10001 --gid support-agent --create-home --shell /usr/sbin/nologin support-agent \

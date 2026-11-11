@@ -11,13 +11,13 @@
    ```
 
 4. Open <http://localhost:8000>. Check liveness at `/health` and database readiness at `/ready`.
-5. Stop the services with `docker compose down`. The named `postgres_data` and `audit_data` volumes remain. Use `docker compose down -v` only when you intentionally want to delete local database and audit data.
+5. Stop the services with `docker compose down`. The named `postgres_data` volume remains. Use `docker compose down -v` only when you intentionally want to delete local database data.
 
-The default Compose Postgres host is `db`. When running the Python app directly on your host instead of in Compose, change `DATABASE_URL` in `.env` to use `localhost`.
+Compose runs Postgres at host `db`. Running the Python app directly on your host uses the SQLite database at `DATABASE_PATH` by default. Apply migrations automatically by starting the app, or run `alembic upgrade head` and `python -m support_agent.seed` manually.
 
 ## Render Blueprint
 
-The repository includes [`render.yaml`](./render.yaml), which creates one Docker web service, a Render Postgres database, and a small persistent disk for the JSONL audit file. The Blueprint uses Render's documented Docker service fields, database connection reference, health-check path, and disk configuration.
+The repository includes [`render.yaml`](./render.yaml), which creates one Docker web service and a Render Postgres database. Orders, refund idempotency records, tickets, audit events, and LangGraph checkpoints use that database.
 
 1. Push this repository to a Git provider supported by Render.
 2. In the Render dashboard, choose **New → Blueprint**, connect the repository, and select this repository's `render.yaml`.
@@ -28,9 +28,11 @@ The repository includes [`render.yaml`](./render.yaml), which creates one Docker
 
 No deployment has been run as part of preparing these files.
 
-## Current application limits
+## Persistence and application limits
 
-- Postgres is currently used by `/ready` as a dependency check. Tickets, approval state, mock orders, and LangGraph checkpoints are still held in process memory. Restarting or scaling beyond one worker loses or splits that state. Keep `WEB_CONCURRENCY=1` and one web instance until shared persistence is implemented.
-- The Render disk persists the JSONL audit file, while structured application logs are also emitted to stdout.
+- An empty `DATABASE_URL` selects SQLite at `DATABASE_PATH` for local development. Set `DATABASE_URL` to use Postgres for both SQLAlchemy models and the LangGraph checkpointer.
+- For the installed LangGraph 1.2 line, local checkpointing uses `SqliteSaver` from `langgraph-checkpoint-sqlite`; deployments with `DATABASE_URL` use `PostgresSaver` from `langgraph-checkpoint-postgres`. The SQLite saver suits local synchronous use; Postgres is the shared production backend.
+- The service applies Alembic migrations and seeds any missing demo orders during startup. `python -m support_agent.seed` applies migrations and inserts missing demo orders without changing existing rows. `/demo/reset` restores the five demo orders and clears their refund idempotency records.
+- `WEB_CONCURRENCY=1` remains the Render default because approval locks are process-local. Postgres persistence is shared, but approval serialization across multiple workers would need a database-backed lock or compare-and-set.
 - The app currently has no user authentication or authorization. Add access control for the support-agent approval and demo endpoints before using this public service with real customer information or transactions.
-- The bundled order backend is mock data. Connect a real order system only after its identity and transaction guarantees are designed and tested.
+- The bundled order backend is seeded demo data. Refund updates and idempotency keys are committed together in a database transaction; integrate a payment provider only if it also accepts an idempotency key for its own external transaction.

@@ -6,17 +6,21 @@ Open: http://127.0.0.1:8000
 import json
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Literal
 
+# Load env and strict checkpoint settings before importing LangGraph modules.
+from .config import LANGGRAPH_STRICT_MSGPACK as _strict_msgpack  # noqa: F401
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from . import tools
+from . import database
 from .database import database_ready
 from .logging_config import configure_logging, ticket_context
 
@@ -53,8 +57,27 @@ def _approval_error(status_code: int, code: str, message: str) -> JSONResponse:
 
 def create_app(graph=None) -> FastAPI:
     """Pass a prebuilt graph for tests. Otherwise the real graph is built on first use."""
-    app = FastAPI(title="Support Resolution Agent")
-    holder = {"graph": graph, "tickets": {}, "approval_locks": {}, "approval_locks_guard": Lock()}
+    holder = {
+        "graph": graph,
+        "checkpointer": None,
+        "approval_locks": {},
+        "approval_locks_guard": Lock(),
+    }
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        database.run_migrations()
+        from .seed import seed_orders
+
+        seed_orders()
+        if holder["graph"] is not None:
+            yield
+            return
+        with database.checkpointer_context() as checkpointer:
+            holder["checkpointer"] = checkpointer
+            yield
+
+    app = FastAPI(title="Support Resolution Agent", lifespan=lifespan)
 
     def get_graph():
         if holder["graph"] is None:
@@ -62,7 +85,9 @@ def create_app(graph=None) -> FastAPI:
                 from .config import get_fast_llm, get_main_llm
                 from .graph import build_graph
 
-                holder["graph"] = build_graph(get_fast_llm(), get_main_llm(), MemorySaver())
+                holder["graph"] = build_graph(
+                    get_fast_llm(), get_main_llm(), holder["checkpointer"]
+                )
             except Exception as e:  # noqa: BLE001 - usually missing API keys
                 raise HTTPException(503, f"Could not start the agent (check API keys in .env): {e}")
         return holder["graph"]
@@ -75,23 +100,18 @@ def create_app(graph=None) -> FastAPI:
             return holder["approval_locks"].setdefault(ticket_id, Lock())
 
     def remember(ticket_id: str, values: dict, *, created_at=None, steps=None):
-        prior = holder["tickets"].get(ticket_id, {})
         pending = values.get("approval") == "pending" or bool(values.get("__interrupt__"))
-        status = "pending_approval" if pending else values.get("resolution", prior.get("status", "processing"))
-        resolved_at = prior.get("resolved_at")
-        if status in ("resolved", "escalated", "needs_info") and not resolved_at:
-            resolved_at = time.time()
-        holder["tickets"][ticket_id] = {
-            **prior,
-            "ticket_id": ticket_id,
-            "message": values.get("message", prior.get("message", "")),
-            "email": values.get("customer_email", prior.get("email", "")),
-            "status": status,
-            "created_at": created_at or prior.get("created_at", time.time()),
-            "resolved_at": resolved_at,
-            "steps": steps if steps is not None else prior.get("steps", []),
-            "values": values,
-        }
+        status = "pending_approval" if pending else values.get("resolution", "processing")
+        database.upsert_ticket(
+            ticket_id,
+            values.get("message", ""),
+            values.get("customer_email", ""),
+            status=status,
+            values=values,
+            steps=steps,
+            created_at=created_at,
+            audit=values.get("audit", []),
+        )
 
     def current_values(g, ticket_id: str, fallback=None):
         snap = g.get_state(cfg(ticket_id))
@@ -119,6 +139,7 @@ def create_app(graph=None) -> FastAPI:
     def create_ticket(body: TicketIn):
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
+        database.create_ticket(ticket_id, body.message.strip(), body.email.strip())
         with ticket_context(ticket_id):
             logger.info("Ticket processing started")
             g = get_graph()
@@ -136,6 +157,7 @@ def create_app(graph=None) -> FastAPI:
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
         initial = {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": body.email.strip()}
+        database.create_ticket(ticket_id, initial["message"], initial["customer_email"])
         g = get_graph()
 
         def events():
@@ -170,21 +192,22 @@ def create_app(graph=None) -> FastAPI:
 
     @app.get("/tickets/{ticket_id}")
     def get_ticket(ticket_id: str):
+        info = database.get_ticket(ticket_id)
+        if info is None:
+            raise HTTPException(404, "Ticket not found")
         with ticket_context(ticket_id):
             g = get_graph()
             snap = g.get_state(cfg(ticket_id))
-            if not snap.values:
-                raise HTTPException(404, "Ticket not found")
             pending = snap.tasks[0].interrupts[0].value if snap.next and snap.tasks and snap.tasks[0].interrupts else None
-            values = dict(snap.values)
-            info = holder["tickets"].get(ticket_id, {})
+            values = dict(snap.values or info["values"])
             logger.info("Ticket detail requested")
-            return {**_shape(ticket_id, values, pending), "message": info.get("message", values.get("message", "")), "email": info.get("email", values.get("customer_email", "")), "steps": info.get("steps", []), "policy_result": values.get("policy_result"), "decision": values.get("decision"), "order": values.get("order"), "created_at": info.get("created_at"), "resolved_at": info.get("resolved_at")}
+            values["audit"] = info["audit"]
+            return {**_shape(ticket_id, values, pending), "message": info["message"], "email": info["email"], "steps": info["steps"], "policy_result": values.get("policy_result"), "decision": values.get("decision"), "order": values.get("order"), "created_at": info["created_at"], "resolved_at": info["resolved_at"]}
 
     @app.post("/tickets/{ticket_id}/approval")
     def decide_approval(ticket_id: str, body: ApprovalIn):
         with approval_lock(ticket_id):
-            info = holder["tickets"].get(ticket_id)
+            info = database.get_ticket(ticket_id)
             if info is None:
                 return _approval_error(404, "ticket_not_found", "Ticket not found")
             if info.get("status") != "pending_approval":
@@ -212,41 +235,30 @@ def create_app(graph=None) -> FastAPI:
 
     @app.get("/agent/approvals")
     def approval_queue():
-        g = get_graph()
         items = []
-        for ticket_id, info in holder["tickets"].items():
-            if info.get("status") != "pending_approval":
-                continue
-            values = current_values(g, ticket_id, info.get("values"))
+        for info in database.list_tickets(status="pending_approval"):
+            values = info["values"]
             decision = values.get("decision", {})
-            items.append({"ticket_id": ticket_id, "message": info.get("message"), "email": info.get("email"), "created_at": info.get("created_at"), "decision": decision, "policy_result": values.get("policy_result"), "order": values.get("order")})
+            items.append({"ticket_id": info["ticket_id"], "message": info["message"], "email": info["email"], "created_at": info["created_at"], "decision": decision, "policy_result": values.get("policy_result"), "order": values.get("order")})
         return items
 
     @app.get("/tickets")
     def list_tickets():
-        return [{"ticket_id": x["ticket_id"], "message": x["message"], "email": x["email"], "status": x["status"], "created_at": x["created_at"]} for x in sorted(holder["tickets"].values(), key=lambda x: x["created_at"], reverse=True)]
+        return [{"ticket_id": x["ticket_id"], "message": x["message"], "email": x["email"], "status": x["status"], "created_at": x["created_at"]} for x in database.list_tickets()]
 
     @app.get("/analytics")
     def analytics():
-        records = list(holder["tickets"].values())
-        total = len(records)
-        auto_resolved = sum(
-            x["status"] == "resolved" and not x.get("values", {}).get("policy_result", {}).get("needs_approval")
-            for x in records
-        )
-        escalated = sum(x["status"] == "escalated" for x in records)
-        approval_needed = sum(bool(x.get("values", {}).get("policy_result", {}).get("needs_approval")) for x in records)
-        approval_completed = sum(bool(x.get("values", {}).get("approval") in ("approved", "rejected")) for x in records)
-        durations = [x["resolved_at"] - x["created_at"] for x in records if x.get("resolved_at")]
-        return {"total_tickets": total, "auto_resolution_rate": round(auto_resolved / total * 100, 1) if total else 0, "escalation_rate": round(escalated / total * 100, 1) if total else 0, "approval_rate": round(approval_completed / approval_needed * 100, 1) if approval_needed else 0, "average_resolution_seconds": round(sum(durations) / len(durations), 1) if durations else 0}
+        return database.analytics()
 
     # ---- demo helpers (mock data only) ----
     @app.get("/demo/orders")
     def demo_orders():
         return [
-            {"order_id": oid, "customer_email": o["customer_email"], "status": o["status"],
-             "total": o["total"], "refunded": o["refunded"]}
-            for oid, o in tools.ORDERS.items()
+            {
+                key: order[key]
+                for key in ("order_id", "customer_email", "status", "total", "refunded")
+            }
+            for order in tools.list_orders()
         ]
 
     @app.post("/demo/reset")

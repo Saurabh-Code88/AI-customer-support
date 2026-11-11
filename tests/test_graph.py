@@ -8,7 +8,6 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import pytest  # noqa: E402
 from fake_llm import FakeLLM  # noqa: E402
-from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
 
 from support_agent import tools  # noqa: E402
 from support_agent.graph import build_graph  # noqa: E402
@@ -18,12 +17,11 @@ TICKETS = json.loads((ROOT / "evals" / "tickets.json").read_text())
 
 
 @pytest.mark.parametrize("t", TICKETS, ids=[t["id"] for t in TICKETS])
-def test_routing(t, tmp_path, monkeypatch):
-    monkeypatch.setattr("support_agent.graph.AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+def test_routing(t, checkpointer):
     tools.reset()
     for oid, amt in t.get("preset_refunded", {}).items():
-        tools.ORDERS[oid]["refunded"] = amt
-    graph = build_graph(FakeLLM(), FakeLLM(), MemorySaver())
+        tools.issue_refund(order_id=oid, amount=amt, ticket_id=f"fixture-{t['id']}-{oid}")
+    graph = build_graph(FakeLLM(), FakeLLM(), checkpointer)
     out = run_ticket(graph, t["message"], t["email"], ticket_id=t["id"], approver=lambda p: "approve")
     assert out["resolution"] == t["expect_resolution"]
     assert (out["_approvals"] > 0) == t["expect_approval"]
@@ -31,13 +29,12 @@ def test_routing(t, tmp_path, monkeypatch):
         assert out["tool_result"]["refunded"] == t["expect_refund_amount"]
 
 
-def test_rejected_approval_escalates(tmp_path, monkeypatch):
-    monkeypatch.setattr("support_agent.graph.AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+def test_rejected_approval_escalates(checkpointer):
     tools.reset()
-    graph = build_graph(FakeLLM(), FakeLLM(), MemorySaver())
+    graph = build_graph(FakeLLM(), FakeLLM(), checkpointer)
     out = run_ticket(graph, "Please refund order A1002", "b@example.com", approver=lambda p: "reject")
     assert out["resolution"] == "escalated"
-    assert tools.ORDERS["A1002"]["refunded"] == 0
+    assert tools.get_order("A1002")["refunded"] == 0
 
 
 class _FlakyClarifyLLM(FakeLLM):
@@ -61,18 +58,16 @@ class _FlakyClarifyLLM(FakeLLM):
         return _S()
 
 
-def test_wrong_clarify_is_retried(tmp_path, monkeypatch):
-    monkeypatch.setattr("support_agent.graph.AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+def test_wrong_clarify_is_retried(checkpointer):
     tools.reset()
     flaky = _FlakyClarifyLLM()
-    graph = build_graph(FakeLLM(), flaky, MemorySaver())
+    graph = build_graph(FakeLLM(), flaky, checkpointer)
     out = run_ticket(graph, "Please refund order A1001.", "a@example.com")
     assert out["resolution"] == "resolved"
     assert flaky.calls == 2
 
 
-def test_refund_retry_after_lost_tool_response_applies_once(tmp_path, monkeypatch):
-    monkeypatch.setattr("support_agent.graph.AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+def test_refund_retry_after_lost_tool_response_applies_once(monkeypatch, checkpointer):
     tools.reset()
     original_run_tool = tools.run_tool
     calls = 0
@@ -87,7 +82,7 @@ def test_refund_retry_after_lost_tool_response_applies_once(tmp_path, monkeypatc
         return result
 
     monkeypatch.setattr("support_agent.graph.T.run_tool", lose_first_refund_response)
-    graph = build_graph(FakeLLM(), FakeLLM(), MemorySaver())
+    graph = build_graph(FakeLLM(), FakeLLM(), checkpointer)
     out = run_ticket(
         graph,
         "Please refund order A1001.",
@@ -97,4 +92,4 @@ def test_refund_retry_after_lost_tool_response_applies_once(tmp_path, monkeypatc
 
     assert out["resolution"] == "resolved"
     assert calls == 2
-    assert tools.ORDERS["A1001"]["refunded"] == 1499.0
+    assert tools.get_order("A1001")["refunded"] == 1499.0
