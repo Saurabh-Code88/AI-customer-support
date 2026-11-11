@@ -1,7 +1,7 @@
 """Production ASGI entry point with JSON-formatted Uvicorn logs."""
 import uvicorn
 
-from .config import PORT, WEB_CONCURRENCY
+from .config import FORWARDED_ALLOW_IPS, PORT, WEB_CONCURRENCY
 from .logging_config import JSON_LOGGING_CONFIG, configure_logging
 
 
@@ -12,6 +12,7 @@ def main() -> None:
         host="0.0.0.0",
         port=PORT,
         workers=WEB_CONCURRENCY,
+        forwarded_allow_ips=FORWARDED_ALLOW_IPS,
         log_config=JSON_LOGGING_CONFIG,
     )
 

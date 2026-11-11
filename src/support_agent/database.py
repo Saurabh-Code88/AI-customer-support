@@ -1,6 +1,7 @@
 """SQLAlchemy database and LangGraph checkpointer configuration."""
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 import time
 from typing import Iterator
 
@@ -15,6 +16,8 @@ from .config import DATABASE_CONNECT_TIMEOUT, DATABASE_PATH, DATABASE_URL
 _engine: Engine | None = None
 _sessions: sessionmaker[Session] | None = None
 _database_url: str | None = None
+_quota_cleanup_lock = Lock()
+_last_quota_cleanup = 0.0
 
 
 def _normalize_url(url: str) -> str:
@@ -112,6 +115,74 @@ def database_ready() -> bool:
             return connection.execute(text("SELECT 1")).scalar_one() == 1
     except Exception:  # noqa: BLE001 - readiness must fail closed without leaking DSN details
         return False
+
+
+def consume_quota(scope: str, bucket_key: str, *, limit: int, window_seconds: int, now: float | None = None) -> bool:
+    """Atomically consume one persistent fixed-window quota slot."""
+    from sqlalchemy.dialects.postgresql import insert as postgres_insert
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    from .models import UsageCounter
+
+    if limit <= 0 or window_seconds <= 0:
+        return False
+    timestamp = time.time() if now is None else now
+    window_start = int(timestamp // window_seconds * window_seconds)
+    engine = get_engine()
+    dialect = engine.dialect.name
+    insert = sqlite_insert if dialect == "sqlite" else postgres_insert if dialect == "postgresql" else None
+    if insert is None:
+        raise RuntimeError(f"Quota counters are unsupported for database dialect {dialect}")
+    statement = insert(UsageCounter).values(
+        scope=scope, bucket_key=bucket_key, window_start=window_start, count=1
+    ).on_conflict_do_update(
+        index_elements=[UsageCounter.scope, UsageCounter.bucket_key, UsageCounter.window_start],
+        set_={"count": UsageCounter.count + 1},
+        where=UsageCounter.count < limit,
+    ).returning(UsageCounter.count)
+    with engine.begin() as connection:
+        accepted = connection.execute(statement).scalar_one_or_none() is not None
+
+    # Keep per-minute visitor buckets bounded during a long-running deployment.
+    global _last_quota_cleanup
+    if timestamp - _last_quota_cleanup >= 3600:
+        with _quota_cleanup_lock:
+            if timestamp - _last_quota_cleanup >= 3600:
+                from sqlalchemy import delete
+
+                with engine.begin() as connection:
+                    connection.execute(delete(UsageCounter).where(
+                        UsageCounter.window_start < int(timestamp) - 7 * 86400
+                    ))
+                _last_quota_cleanup = timestamp
+    return accepted
+
+
+def consume_daily_llm_call() -> bool:
+    from .config import LLM_DAILY_CALL_CAP
+
+    return consume_quota(
+        "llm_daily", "global", limit=LLM_DAILY_CALL_CAP,
+        window_seconds=86400,
+    )
+
+
+def daily_llm_capacity_available() -> bool:
+    from sqlalchemy import select
+
+    from .config import LLM_DAILY_CALL_CAP
+    from .models import UsageCounter
+
+    if LLM_DAILY_CALL_CAP <= 0:
+        return False
+    window_start = int(time.time() // 86400 * 86400)
+    with get_session_factory()() as session:
+        count = session.scalar(select(UsageCounter.count).where(
+            UsageCounter.scope == "llm_daily",
+            UsageCounter.bucket_key == "global",
+            UsageCounter.window_start == window_start,
+        )) or 0
+    return count < LLM_DAILY_CALL_CAP
 
 
 def create_ticket(ticket_id: str, message: str, email: str) -> None:

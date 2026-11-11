@@ -1,7 +1,9 @@
 """Signed, short-lived identities for the public portfolio sandbox."""
 from dataclasses import dataclass
+import hashlib
 import os
 import time
+import uuid
 from typing import Literal
 
 import jwt
@@ -17,15 +19,26 @@ bearer = HTTPBearer(auto_error=False)
 class Principal:
     role: Role
     email: str | None
+    session_id: str
 
 
 def jwt_secret() -> str:
-    return os.getenv("AUTH_JWT_SECRET", "")
+    return os.getenv("AUTH_JWT_SECRET", "").strip()
 
 
 def validate_auth_configuration() -> None:
-    if os.getenv("APP_ENV", "development").lower() in {"prod", "production"} and not jwt_secret():
+    environment = (os.getenv("ENV") or os.getenv("APP_ENV", "development")).lower()
+    if environment not in {"prod", "production"}:
+        return
+    missing = []
+    if not jwt_secret():
         raise RuntimeError("AUTH_JWT_SECRET is required in production")
+    if not os.getenv("GOOGLE_API_KEY", "").strip():
+        missing.append("GOOGLE_API_KEY")
+    if not os.getenv("GROQ_API_KEY", "").strip():
+        missing.append("GROQ_API_KEY")
+    if missing:
+        raise RuntimeError(f"{', '.join(missing)} are required in production")
 
 
 def token_ttl() -> int:
@@ -38,7 +51,8 @@ def issue_token(role: Role, email: str | None = None) -> tuple[str, int]:
         raise HTTPException(503, detail={"code": "auth_unconfigured", "message": "Sessions are temporarily unavailable."})
     ttl = token_ttl()
     now = int(time.time())
-    claims = {"iss": ISSUER, "sub": email or "support-agent", "role": role, "iat": now, "exp": now + ttl}
+    claims = {"iss": ISSUER, "sub": email or "support-agent", "role": role, "iat": now,
+              "exp": now + ttl, "jti": uuid.uuid4().hex}
     return jwt.encode(claims, secret, algorithm="HS256"), ttl
 
 
@@ -51,7 +65,8 @@ def require_principal(credentials: HTTPAuthorizationCredentials | None = Depends
         email = claims.get("sub") if role == "customer" else None
         if role not in {"customer", "agent"} or (role == "customer" and not isinstance(email, str)):
             raise jwt.InvalidTokenError("invalid role or subject")
-        return Principal(role=role, email=email)
+        session_id = hashlib.sha256(credentials.credentials.encode()).hexdigest()
+        return Principal(role=role, email=email, session_id=session_id)
     except jwt.ExpiredSignatureError as exc:
         raise HTTPException(401, detail={"code": "token_expired", "message": "Your session expired. Please choose a role again."}, headers={"WWW-Authenticate": "Bearer"}) from exc
     except jwt.InvalidTokenError as exc:

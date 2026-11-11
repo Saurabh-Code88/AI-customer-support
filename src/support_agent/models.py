@@ -54,3 +54,13 @@ class AuditEvent(Base):
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     event: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class UsageCounter(Base):
+    """Atomic fixed-window quota counter; keys stored here are hashed identifiers."""
+    __tablename__ = "usage_counters"
+
+    scope: Mapped[str] = mapped_column(String(40), primary_key=True)
+    bucket_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_start: Mapped[int] = mapped_column(Integer, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)

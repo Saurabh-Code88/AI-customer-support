@@ -3,6 +3,7 @@
 Run:  python -m uvicorn support_agent.api:app --reload      (from the project folder, with PYTHONPATH=src)
 Open: http://127.0.0.1:8000
 """
+import hashlib
 import json
 import re
 import time
@@ -13,10 +14,20 @@ from threading import Lock
 from typing import Literal
 
 # Load env and strict checkpoint settings before importing LangGraph modules.
-from .config import LANGGRAPH_STRICT_MSGPACK as _strict_msgpack  # noqa: F401
+from .config import (
+    APP_ENV,
+    DEMO_RESET_COOLDOWN_SECONDS,
+    FRONTEND_ORIGIN,
+    LANGGRAPH_STRICT_MSGPACK as _strict_msgpack,  # noqa: F401
+    MAX_REQUEST_BODY_BYTES,
+    TICKET_RATE_LIMIT_PER_IP,
+    TICKET_RATE_LIMIT_PER_SESSION,
+    TICKET_RATE_LIMIT_WINDOW_SECONDS,
+)
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -26,6 +37,7 @@ from . import database
 from .database import database_ready
 from .logging_config import configure_logging, redact_emails, ticket_context
 from .auth import Principal, issue_token, require_principal, require_role, validate_auth_configuration
+from .security import RequestSizeLimitMiddleware
 
 STATIC = Path(__file__).parent / "static"
 logger = configure_logging()
@@ -98,6 +110,12 @@ def create_app(graph=None) -> FastAPI:
             yield
 
     app = FastAPI(title="Support Resolution Agent", lifespan=lifespan)
+    app.add_middleware(CORSMiddleware, allow_origins=[FRONTEND_ORIGIN], allow_credentials=True,
+                       allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
+    app.add_middleware(
+        RequestSizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES,
+        secure_hsts=APP_ENV in {"prod", "production"},
+    )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError):
@@ -128,6 +146,28 @@ def create_app(graph=None) -> FastAPI:
     def approval_lock(ticket_id: str):
         with holder["approval_locks_guard"]:
             return holder["approval_locks"].setdefault(ticket_id, Lock())
+
+    def ticket_rate_limit(request: Request, principal: Principal) -> JSONResponse | None:
+        ip = request.client.host if request.client else "unknown"
+        ip_key = hashlib.sha256(ip.encode()).hexdigest()
+        allowed_ip = database.consume_quota(
+            "ticket_ip", ip_key, limit=TICKET_RATE_LIMIT_PER_IP,
+            window_seconds=TICKET_RATE_LIMIT_WINDOW_SECONDS,
+        )
+        allowed_session = database.consume_quota(
+            "ticket_session", principal.session_id, limit=TICKET_RATE_LIMIT_PER_SESSION,
+            window_seconds=TICKET_RATE_LIMIT_WINDOW_SECONDS,
+        ) if allowed_ip else False
+        if allowed_ip and allowed_session:
+            return None
+        return JSONResponse(status_code=429, content={"error": {
+            "code": "ticket_rate_limited", "message": "Too many ticket submissions. Please try again shortly.",
+        }})
+
+    def demo_limit_response() -> JSONResponse:
+        return JSONResponse(status_code=429, content={"error": {
+            "code": "demo_limit_reached", "message": "Demo limit reached. Try again later.",
+        }})
 
     def remember(ticket_id: str, values: dict, *, created_at=None, steps=None):
         pending = values.get("approval") == "pending" or bool(values.get("__interrupt__"))
@@ -182,9 +222,14 @@ def create_app(graph=None) -> FastAPI:
         return FileResponse(STATIC / "index.html")
 
     @app.post("/tickets")
-    def create_ticket(body: TicketIn, principal: Principal = Depends(require_role("customer"))):
+    def create_ticket(request: Request, body: TicketIn, principal: Principal = Depends(require_role("customer"))):
         if not _valid_customer_email(principal.email):
             return _invalid_customer_email()
+        if not database.daily_llm_capacity_available():
+            return demo_limit_response()
+        limited = ticket_rate_limit(request, principal)
+        if limited:
+            return limited
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
         email = principal.email
@@ -202,9 +247,14 @@ def create_app(graph=None) -> FastAPI:
         return _shape(ticket_id, result, pending)
 
     @app.post("/tickets/stream")
-    def create_ticket_stream(body: TicketIn, principal: Principal = Depends(require_role("customer"))):
+    def create_ticket_stream(request: Request, body: TicketIn, principal: Principal = Depends(require_role("customer"))):
         if not _valid_customer_email(principal.email):
             return _invalid_customer_email()
+        if not database.daily_llm_capacity_available():
+            return demo_limit_response()
+        limited = ticket_rate_limit(request, principal)
+        if limited:
+            return limited
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
         initial = {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": principal.email}
@@ -319,6 +369,13 @@ def create_app(graph=None) -> FastAPI:
 
     @app.post("/demo/reset")
     def demo_reset(_principal: Principal = Depends(require_role("agent"))):
+        if not database.consume_quota(
+            "demo_reset_session", _principal.session_id, limit=1,
+            window_seconds=DEMO_RESET_COOLDOWN_SECONDS,
+        ):
+            return JSONResponse(status_code=429, content={"error": {
+                "code": "reset_rate_limited", "message": "Demo data was recently reset. Please wait a minute before resetting again.",
+            }})
         tools.reset()
         return {"ok": True}
 

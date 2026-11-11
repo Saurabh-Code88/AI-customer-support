@@ -152,3 +152,11 @@ def test_repeated_malformed_decision_escalates(checkpointer, monkeypatch):
     out = run_ticket(graph, "Please refund order A1001.", "a@example.com")
     assert out["resolution"] == "escalated"
     assert "decide: escalate" in " ".join(out["audit"])
+
+
+def test_daily_call_cap_escalates_with_friendly_message(checkpointer):
+    tools.reset()
+    graph = build_graph(FakeLLM(), FakeLLM(), checkpointer, llm_call_guard=lambda: False)
+    out = run_ticket(graph, "Where is order A1001?", "a@example.com")
+    assert out["resolution"] == "escalated"
+    assert out["reply"] == "Demo limit reached. Try again later."

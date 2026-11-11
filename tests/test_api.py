@@ -34,6 +34,77 @@ def test_health_and_index(client):
     assert client.get("/health").json() == {"ok": True}
     r = client.get("/")
     assert r.status_code == 200 and "Support Resolution Agent" in r.text
+    assert "Sandbox with fake data. Do not enter real personal information." in r.text
+
+
+def test_request_size_and_security_headers(client):
+    response = client.get("/health")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    oversized = client.post("/tickets", content=b"x" * 17000, headers={"Content-Type": "application/json"})
+    assert oversized.status_code == 413
+    assert oversized.json()["error"]["code"] == "request_too_large"
+
+
+def test_cors_allows_only_configured_frontend_origin(client):
+    allowed = client.options("/tickets", headers={
+        "Origin": "http://localhost:8000", "Access-Control-Request-Method": "POST",
+    })
+    denied = client.options("/tickets", headers={
+        "Origin": "https://untrusted.example", "Access-Control-Request-Method": "POST",
+    })
+    assert allowed.headers.get("access-control-allow-origin") == "http://localhost:8000"
+    assert "access-control-allow-origin" not in denied.headers
+
+
+def test_ticket_rate_limit_is_applied_per_ip(client, monkeypatch):
+    import support_agent.api as api
+
+    monkeypatch.setattr(api, "TICKET_RATE_LIMIT_PER_IP", 1)
+    monkeypatch.setattr(api, "TICKET_RATE_LIMIT_PER_SESSION", 10)
+    assert client.post("/tickets", json={"message": "Where is order A1001?"}).status_code == 200
+    blocked = client.post("/tickets", json={"message": "Where is order A1001?"})
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "ticket_rate_limited"
+
+
+def test_ticket_rate_limit_is_applied_per_session(client, monkeypatch):
+    import support_agent.api as api
+
+    monkeypatch.setattr(api, "TICKET_RATE_LIMIT_PER_IP", 10)
+    monkeypatch.setattr(api, "TICKET_RATE_LIMIT_PER_SESSION", 1)
+    token_a = auth_headers()
+    token_b = auth_headers()
+    assert client.post("/tickets", json={"message": "Where is order A1001?"}, headers=token_a).status_code == 200
+    assert client.post("/tickets", json={"message": "Where is order A1001?"}, headers=token_b).status_code == 200
+    blocked = client.post("/tickets", json={"message": "Where is order A1001?"}, headers=token_a)
+    assert blocked.status_code == 429
+
+
+def test_daily_llm_cap_returns_friendly_response(client, monkeypatch):
+    monkeypatch.setattr("support_agent.api.database.daily_llm_capacity_available", lambda: False)
+    response = client.post("/tickets", json={"message": "Where is order A1001?"})
+    assert response.status_code == 429
+    assert response.json()["error"] == {
+        "code": "demo_limit_reached", "message": "Demo limit reached. Try again later.",
+    }
+
+
+def test_quota_counter_enforces_limit_and_resets_by_window():
+    from support_agent.database import consume_quota
+
+    assert consume_quota("test_scope", "hashed-test-key", limit=1, window_seconds=60, now=120)
+    assert not consume_quota("test_scope", "hashed-test-key", limit=1, window_seconds=60, now=121)
+    assert consume_quota("test_scope", "hashed-test-key", limit=1, window_seconds=60, now=180)
+
+
+def test_demo_reset_has_per_session_cooldown(client):
+    first = auth_headers("agent")
+    assert client.post("/demo/reset", headers=first).status_code == 200
+    blocked = client.post("/demo/reset", headers=first)
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "reset_rate_limited"
+    assert client.post("/demo/reset", headers=auth_headers("agent")).status_code == 200
 
 
 def test_readiness_requires_database(client, monkeypatch):
@@ -292,6 +363,18 @@ def test_production_requires_signing_secret(monkeypatch):
     from support_agent.auth import validate_auth_configuration
 
     monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("ENV", raising=False)
     monkeypatch.delenv("AUTH_JWT_SECRET", raising=False)
     with pytest.raises(RuntimeError, match="AUTH_JWT_SECRET is required in production"):
+        validate_auth_configuration()
+
+
+def test_env_production_requires_provider_secrets(monkeypatch):
+    from support_agent.auth import validate_auth_configuration
+
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "test-secret")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="GOOGLE_API_KEY, GROQ_API_KEY are required"):
         validate_auth_configuration()

@@ -23,6 +23,7 @@ logger = configure_logging()
 
 class State(TypedDict, total=False):
     ticket_id: str
+    llm_failure: str
     message: str
     customer_email: str
     intent: str
@@ -74,7 +75,11 @@ class ModelOutputError(RuntimeError):
     """All configured model attempts failed or returned invalid structured output."""
 
 
-def _invoke_with_fallback(primary, fallback, messages, *, stage: str, schema=None):
+class DemoLimitReached(RuntimeError):
+    """The configured daily model-call allowance is exhausted."""
+
+
+def _invoke_with_fallback(primary, fallback, messages, *, stage: str, schema=None, call_guard=None):
     candidates = [("primary", primary)]
     if fallback is not None:
         candidates.append(("fallback", fallback))
@@ -82,10 +87,14 @@ def _invoke_with_fallback(primary, fallback, messages, *, stage: str, schema=Non
     for provider_name, runnable in candidates:
         for attempt in range(LLM_MAX_RETRIES + 1):
             try:
+                if call_guard is not None and not call_guard():
+                    raise DemoLimitReached
                 result = runnable.invoke(messages)
                 if schema is not None and not isinstance(result, schema):
                     result = schema.model_validate(result)
                 return result
+            except DemoLimitReached:
+                raise
             except Exception as exc:  # provider and parser errors share a safe retry boundary
                 last_error = exc
                 logger.warning(
@@ -98,7 +107,11 @@ def _invoke_with_fallback(primary, fallback, messages, *, stage: str, schema=Non
     raise ModelOutputError(type(last_error).__name__ if last_error else "unknown")
 
 
-def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallback=None):
+def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallback=None, llm_call_guard=None):
+    if llm_call_guard is None:
+        from .database import consume_daily_llm_call
+
+        llm_call_guard = consume_daily_llm_call
     classifier = fast.with_structured_output(Classification)
     decider = main.with_structured_output(Decision)
     fallback_classifier = fast_fallback.with_structured_output(Classification) if fast_fallback else None
@@ -109,8 +122,11 @@ def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallb
             c = _invoke_with_fallback(
                 classifier, fallback_classifier,
                 [("system", CLASSIFY_PROMPT), ("human", s["message"])],
-                stage="classify", schema=Classification,
+                stage="classify", schema=Classification, call_guard=llm_call_guard,
             )
+        except DemoLimitReached:
+            return {"intent": "other", "order_id": None, "llm_failure": "demo_limit",
+                    "audit": ["classify: daily demo model-call limit reached"]}
         except ModelOutputError as exc:
             return {"intent": "other", "order_id": None,
                     "llm_failure": "classification output could not be validated", "audit": [
@@ -134,7 +150,8 @@ def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallb
     def decide(s: State):
         order_ids = set(re.findall(r"\bA\d{4}\b", s["message"]))
         if s.get("llm_failure"):
-            d = Decision(action="escalate", reason="Model output could not be validated; human review required")
+            reason = "Daily demo model-call limit reached" if s["llm_failure"] == "demo_limit" else "Model output could not be validated; human review required"
+            d = Decision(action="escalate", reason=reason)
         elif len(order_ids) > 1:
             # Deterministic rule: one ticket = one order. No LLM call needed.
             d = Decision(action="escalate", reason="Message mentions multiple orders; needs human review")
@@ -151,7 +168,10 @@ def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallb
             )
             msgs = [("system", DECIDE_PROMPT), ("human", prompt)]
             try:
-                d = _invoke_with_fallback(decider, fallback_decider, msgs, stage="decide", schema=Decision)
+                d = _invoke_with_fallback(decider, fallback_decider, msgs, stage="decide", schema=Decision, call_guard=llm_call_guard)
+            except DemoLimitReached:
+                return {"decision": Decision(action="escalate", reason="Daily demo model-call limit reached").model_dump(),
+                        "llm_failure": "demo_limit", "audit": ["decide: daily demo model-call limit reached"]}
             except ModelOutputError:
                 d = Decision(action="escalate", reason="Model output could not be validated; human review required")
             if d.action == "clarify" and s.get("order_id") and s["intent"] in ("refund", "order_status"):
@@ -162,7 +182,14 @@ def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallb
                         msgs + [("human", "Correction: the order ID is already provided, so clarify is not allowed. "
                                           "Choose use_tool, or escalate if it truly cannot be done.")],
                         stage="decide", schema=Decision,
+                        call_guard=llm_call_guard,
                     )
+                except DemoLimitReached:
+                    return {
+                        "decision": Decision(action="escalate", reason="Daily demo model-call limit reached").model_dump(),
+                        "llm_failure": "demo_limit",
+                        "audit": ["decide: daily demo model-call limit reached"],
+                    }
                 except ModelOutputError:
                     d = Decision(action="escalate", reason="Model output could not be validated; human review required")
                 if d.action == "clarify":
@@ -221,26 +248,37 @@ def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallb
             msg = _invoke_with_fallback(
                 fast, fast_fallback,
                 [("system", RESPOND_PROMPT), ("human", f"Customer message: {s['message']}\nTool result: {json.dumps(s['tool_result'])}")],
-                stage="respond",
+                stage="respond", call_guard=llm_call_guard,
             )
+        except DemoLimitReached:
+            return {"reply": "Demo limit reached. Try again later.",
+                    "resolution": "escalated", "audit": ["respond: daily demo model-call limit reached"]}
         except ModelOutputError:
             return {"reply": "I've passed your request to a human support agent who will follow up shortly.",
                     "resolution": "escalated", "audit": ["respond: model unavailable; human follow-up required"]}
         return {"reply": msg.content, "resolution": "resolved", "audit": ["respond: customer reply prepared"]}
 
     def escalate(s: State):
-        if s.get("llm_failure"):
+        if s.get("llm_failure") == "demo_limit":
+            audit_event = "escalate: daily demo model-call limit reached"
+            reply = "Demo limit reached. Try again later."
+        elif s.get("llm_failure"):
             audit_event = "escalate: model output unavailable"
+            reply = "I've passed your request to a human support agent who will follow up shortly."
         elif s.get("approval") == "rejected":
             audit_event = "escalate: approval rejected"
+            reply = "I've passed your request to a human support agent who will follow up shortly."
         elif s.get("policy_result") and not s["policy_result"]["allowed"]:
             audit_event = f"escalate: policy blocked ({s['policy_result']['reason']})"
+            reply = "I've passed your request to a human support agent who will follow up shortly."
         elif s.get("tool_result") and not s["tool_result"].get("ok"):
             audit_event = "escalate: tool retries exhausted"
+            reply = "I've passed your request to a human support agent who will follow up shortly."
         else:
             audit_event = "escalate: human review required"
+            reply = "I've passed your request to a human support agent who will follow up shortly."
         return {
-            "reply": "I've passed your request to a human support agent who will follow up shortly.",
+            "reply": reply,
             "resolution": "escalated",
             "audit": [audit_event],
         }
