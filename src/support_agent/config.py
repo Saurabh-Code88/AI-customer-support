@@ -27,21 +27,34 @@ APP_ENV = os.getenv("APP_ENV", "development").lower()
 REFUND_WINDOW_DAYS = int(os.getenv("REFUND_WINDOW_DAYS", "30"))
 REFUND_AUTO_LIMIT = float(os.getenv("REFUND_AUTO_LIMIT", "2000"))
 MAX_LOOPS = int(os.getenv("MAX_LOOPS", "2"))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+LLM_RETRY_BASE_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "0.25"))
+
+
+def get_provider_llm(provider: str):
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+
+        return ChatGroq(model=GROQ_MODEL, temperature=0, request_timeout=LLM_TIMEOUT_SECONDS, max_retries=0)
+    if provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        return ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, timeout=LLM_TIMEOUT_SECONDS, max_retries=0)
+    raise ValueError("Provider must be 'gemini' or 'groq'")
 
 
 def get_fast_llm():
-    from langchain_groq import ChatGroq
-
-    return ChatGroq(model=GROQ_MODEL, temperature=0)
+    return get_provider_llm("groq")
 
 
 def get_main_llm():
     if MAIN_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-
-        return ChatGroq(model=GROQ_MODEL, temperature=0)
+        return get_provider_llm("groq")
     if MAIN_PROVIDER != "gemini":
         raise ValueError("MAIN_PROVIDER must be 'gemini' or 'groq'")
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    return get_provider_llm("gemini")
 
-    return ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
+
+def get_other_provider_llm(provider: str):
+    return get_provider_llm("groq" if provider == "gemini" else "gemini")

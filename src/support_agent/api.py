@@ -4,6 +4,7 @@ Run:  python -m uvicorn support_agent.api:app --reload      (from the project fo
 Open: http://127.0.0.1:8000
 """
 import json
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -14,7 +15,8 @@ from typing import Literal
 # Load env and strict checkpoint settings before importing LangGraph modules.
 from .config import LANGGRAPH_STRICT_MSGPACK as _strict_msgpack  # noqa: F401
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -22,7 +24,7 @@ from pydantic import BaseModel, Field
 from . import tools
 from . import database
 from .database import database_ready
-from .logging_config import configure_logging, ticket_context
+from .logging_config import configure_logging, redact_emails, ticket_context
 from .auth import Principal, issue_token, require_principal, require_role, validate_auth_configuration
 
 STATIC = Path(__file__).parent / "static"
@@ -32,6 +34,17 @@ logger = configure_logging()
 class TicketIn(BaseModel):
     model_config = {"extra": "forbid"}
     message: str = Field(min_length=3, max_length=2000)
+
+
+def _valid_customer_email(email: str | None) -> bool:
+    return bool(email and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email))
+
+
+def _invalid_customer_email() -> JSONResponse:
+    return JSONResponse(status_code=422, content={"error": {
+        "code": "validation_error", "message": "Invalid request.",
+        "fields": [{"field": "email", "code": "invalid_email"}],
+    }})
 
 
 class SessionIn(BaseModel):
@@ -50,7 +63,7 @@ def _shape(ticket_id: str, values: dict, pending_payload=None) -> dict:
         "status": "pending_approval" if pending_payload else values.get("resolution"),
         "reply": None if pending_payload else values.get("reply"),
         "approval": pending_payload,
-        "audit": values.get("audit", []),
+        "audit": redact_emails(values.get("audit", [])),
     }
 
 
@@ -86,14 +99,24 @@ def create_app(graph=None) -> FastAPI:
 
     app = FastAPI(title="Support Resolution Agent", lifespan=lifespan)
 
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, exc: RequestValidationError):
+        fields = [{"field": ".".join(map(str, error.get("loc", ())[1:])), "code": error.get("type", "invalid")}
+                  for error in exc.errors()]
+        return JSONResponse(status_code=422, content={"error": {
+            "code": "validation_error", "message": "Invalid request.", "fields": fields,
+        }})
+
     def get_graph():
         if holder["graph"] is None:
             try:
-                from .config import get_fast_llm, get_main_llm
+                from .config import get_fast_llm, get_main_llm, get_other_provider_llm, MAIN_PROVIDER
                 from .graph import build_graph
 
                 holder["graph"] = build_graph(
-                    get_fast_llm(), get_main_llm(), holder["checkpointer"]
+                    get_fast_llm(), get_main_llm(), holder["checkpointer"],
+                    fast_fallback=get_other_provider_llm("groq"),
+                    main_fallback=get_other_provider_llm(MAIN_PROVIDER),
                 )
             except Exception as e:  # noqa: BLE001 - usually missing API keys
                 raise HTTPException(503, f"Could not start the agent (check API keys in .env): {e}")
@@ -160,6 +183,8 @@ def create_app(graph=None) -> FastAPI:
 
     @app.post("/tickets")
     def create_ticket(body: TicketIn, principal: Principal = Depends(require_role("customer"))):
+        if not _valid_customer_email(principal.email):
+            return _invalid_customer_email()
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
         email = principal.email
@@ -178,6 +203,8 @@ def create_app(graph=None) -> FastAPI:
 
     @app.post("/tickets/stream")
     def create_ticket_stream(body: TicketIn, principal: Principal = Depends(require_role("customer"))):
+        if not _valid_customer_email(principal.email):
+            return _invalid_customer_email()
         ticket_id = f"T-{uuid.uuid4().hex[:6]}"
         created_at = time.time()
         initial = {"ticket_id": ticket_id, "message": body.message.strip(), "customer_email": principal.email}
@@ -208,8 +235,8 @@ def create_app(graph=None) -> FastAPI:
                 remember(ticket_id, values, created_at=created_at, steps=steps)
                 logger.info("Ticket processing paused for approval" if pending_payload else "Ticket processing completed", extra={"ticket_id": ticket_id})
                 yield f"event: complete\ndata: {json.dumps(_shape(ticket_id, values, pending_payload))}\n\n"
-            except Exception:
-                logger.exception("Ticket streaming failed", extra={"ticket_id": ticket_id})
+            except Exception as exc:  # Avoid exception text: provider errors may contain prompts.
+                logger.error("Ticket streaming failed", extra={"ticket_id": ticket_id, "error_type": type(exc).__name__})
                 yield f"event: error\ndata: {json.dumps({'message': 'Ticket processing failed. Please try again.'})}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

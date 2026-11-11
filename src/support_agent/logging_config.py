@@ -1,6 +1,7 @@
 """JSON logging helpers with ticket context on every application log record."""
 import json
 import logging
+import re
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -9,6 +10,20 @@ from datetime import datetime, timezone
 from .config import LOG_LEVEL
 
 _ticket_id = ContextVar("support_agent_ticket_id", default="system")
+_EMAIL = re.compile(r"\b([A-Z0-9._%+-])[A-Z0-9._%+-]*@([A-Z0-9.-]+\.[A-Z]{2,})\b", re.IGNORECASE)
+
+
+def redact_emails(value):
+    """Mask email addresses recursively before data reaches logs or audit output."""
+    if isinstance(value, str):
+        return _EMAIL.sub(r"\1***@\2", value)
+    if isinstance(value, list):
+        return [redact_emails(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_emails(item) for item in value)
+    if isinstance(value, dict):
+        return {key: redact_emails(item) for key, item in value.items()}
+    return value
 
 
 @contextmanager
@@ -29,12 +44,12 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "ticket_id": getattr(record, "ticket_id", None) or _ticket_id.get() or "system",
         }
-        for field in ("graph_step", "approval_decision"):
+        for field in ("graph_step", "approval_decision", "provider", "attempt", "error_type"):
             if hasattr(record, field):
                 entry[field] = getattr(record, field)
         if record.exc_info:
             entry["exception"] = self.formatException(record.exc_info)
-        return json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(redact_emails(entry), ensure_ascii=False, separators=(",", ":"))
 
 
 def configure_logging() -> logging.Logger:

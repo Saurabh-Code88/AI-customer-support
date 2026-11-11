@@ -133,9 +133,11 @@ def upsert_ticket(
     from sqlalchemy import delete
 
     from .models import AuditEvent, TicketRecord
+    from .logging_config import redact_emails
 
     values = values or {}
     safe_values = {key: value for key, value in values.items() if key != "__interrupt__"}
+    safe_values["audit"] = redact_emails(audit if audit is not None else safe_values.get("audit", []))
     factory = get_session_factory()
     with factory.begin() as session:
         record = session.get(TicketRecord, ticket_id)
@@ -157,7 +159,7 @@ def upsert_ticket(
         if audit is not None:
             session.execute(delete(AuditEvent).where(AuditEvent.ticket_id == ticket_id))
             session.add_all(
-                AuditEvent(ticket_id=ticket_id, position=index, event=entry)
+                AuditEvent(ticket_id=ticket_id, position=index, event=redact_emails(entry))
                 for index, entry in enumerate(audit)
             )
     return get_ticket(ticket_id)  # type: ignore[return-value]

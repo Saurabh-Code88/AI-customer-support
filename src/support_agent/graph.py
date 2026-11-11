@@ -2,6 +2,7 @@
 import json
 import operator
 import re
+import time
 from typing import Annotated, Optional, TypedDict
 
 from .config import MAX_LOOPS
@@ -12,6 +13,7 @@ from langgraph.types import interrupt
 from . import policy as P
 from . import tools as T
 from .database import upsert_ticket
+from .config import LLM_MAX_RETRIES, LLM_RETRY_BASE_SECONDS
 from .logging_config import configure_logging
 from .retrieval import retrieve_policies
 from .schemas import Classification, Decision
@@ -65,13 +67,55 @@ RESPOND_PROMPT = (
     "in the result. For refund amounts use the refunded_text field exactly as given."
 )
 
+logger = configure_logging()
 
-def build_graph(fast, main, checkpointer=None):
+
+class ModelOutputError(RuntimeError):
+    """All configured model attempts failed or returned invalid structured output."""
+
+
+def _invoke_with_fallback(primary, fallback, messages, *, stage: str, schema=None):
+    candidates = [("primary", primary)]
+    if fallback is not None:
+        candidates.append(("fallback", fallback))
+    last_error = None
+    for provider_name, runnable in candidates:
+        for attempt in range(LLM_MAX_RETRIES + 1):
+            try:
+                result = runnable.invoke(messages)
+                if schema is not None and not isinstance(result, schema):
+                    result = schema.model_validate(result)
+                return result
+            except Exception as exc:  # provider and parser errors share a safe retry boundary
+                last_error = exc
+                logger.warning(
+                    "LLM attempt failed",
+                    extra={"graph_step": stage, "provider": provider_name,
+                           "attempt": attempt + 1, "error_type": type(exc).__name__},
+                )
+                if attempt < LLM_MAX_RETRIES:
+                    time.sleep(LLM_RETRY_BASE_SECONDS * (2 ** attempt))
+    raise ModelOutputError(type(last_error).__name__ if last_error else "unknown")
+
+
+def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallback=None):
     classifier = fast.with_structured_output(Classification)
     decider = main.with_structured_output(Decision)
+    fallback_classifier = fast_fallback.with_structured_output(Classification) if fast_fallback else None
+    fallback_decider = main_fallback.with_structured_output(Decision) if main_fallback else None
 
     def classify(s: State):
-        c = classifier.invoke([("system", CLASSIFY_PROMPT), ("human", s["message"])])
+        try:
+            c = _invoke_with_fallback(
+                classifier, fallback_classifier,
+                [("system", CLASSIFY_PROMPT), ("human", s["message"])],
+                stage="classify", schema=Classification,
+            )
+        except ModelOutputError as exc:
+            return {"intent": "other", "order_id": None,
+                    "llm_failure": "classification output could not be validated", "audit": [
+                f"classify: model output unavailable ({type(exc).__name__}); escalated for human review"
+            ]}
         return {
             "intent": c.intent,
             "order_id": c.order_id,
@@ -89,7 +133,9 @@ def build_graph(fast, main, checkpointer=None):
 
     def decide(s: State):
         order_ids = set(re.findall(r"\bA\d{4}\b", s["message"]))
-        if len(order_ids) > 1:
+        if s.get("llm_failure"):
+            d = Decision(action="escalate", reason="Model output could not be validated; human review required")
+        elif len(order_ids) > 1:
             # Deterministic rule: one ticket = one order. No LLM call needed.
             d = Decision(action="escalate", reason="Message mentions multiple orders; needs human review")
         elif s.get("order") and s["order"]["customer_email"].lower() != s["customer_email"].lower():
@@ -104,13 +150,21 @@ def build_graph(fast, main, checkpointer=None):
                 f"Policies:\n" + "\n".join(s.get("policies", []))
             )
             msgs = [("system", DECIDE_PROMPT), ("human", prompt)]
-            d = decider.invoke(msgs)
+            try:
+                d = _invoke_with_fallback(decider, fallback_decider, msgs, stage="decide", schema=Decision)
+            except ModelOutputError:
+                d = Decision(action="escalate", reason="Model output could not be validated; human review required")
             if d.action == "clarify" and s.get("order_id") and s["intent"] in ("refund", "order_status"):
                 # The order ID is already known, so a clarifying question is wrong. Retry once.
-                d = decider.invoke(
-                    msgs + [("human", "Correction: the order ID is already provided, so clarify is not allowed. "
-                                      "Choose use_tool, or escalate if it truly cannot be done.")]
-                )
+                try:
+                    d = _invoke_with_fallback(
+                        decider, fallback_decider,
+                        msgs + [("human", "Correction: the order ID is already provided, so clarify is not allowed. "
+                                          "Choose use_tool, or escalate if it truly cannot be done.")],
+                        stage="decide", schema=Decision,
+                    )
+                except ModelOutputError:
+                    d = Decision(action="escalate", reason="Model output could not be validated; human review required")
                 if d.action == "clarify":
                     d = Decision(action="escalate", reason="Model kept asking for clarification on a complete request")
             if d.action == "use_tool" and d.tool_name == "update_address" and not d.new_address:
@@ -119,7 +173,7 @@ def build_graph(fast, main, checkpointer=None):
                     reply_draft="What new address should we ship this order to?",
                     reason="Missing new address",
                 )
-        return {"decision": d.model_dump(), "audit": [f"decide: {d.action} {d.tool_name} ({d.reason})"]}
+        return {"decision": d.model_dump(), "audit": [f"decide: {d.action} {d.tool_name or ''}".rstrip()]}
 
     def policy_check(s: State):
         r = P.check(s["decision"], s.get("order"), s["customer_email"])
@@ -152,7 +206,7 @@ def build_graph(fast, main, checkpointer=None):
             return {
                 "tool_result": {"ok": False, "error": str(e)},
                 "loops": s.get("loops", 0) + 1,
-                "audit": [f"tool: {d['tool_name']} failed: {e}"],
+                "audit": [f"tool: {d['tool_name']} failed ({type(e).__name__})"],
             }
 
     def respond(s: State):
@@ -163,24 +217,32 @@ def build_graph(fast, main, checkpointer=None):
                 "resolution": "needs_info",
                 "audit": ["respond: clarification prepared"],
             }
-        msg = fast.invoke(
-            [("system", RESPOND_PROMPT), ("human", f"Customer message: {s['message']}\nTool result: {json.dumps(s['tool_result'])}")]
-        )
+        try:
+            msg = _invoke_with_fallback(
+                fast, fast_fallback,
+                [("system", RESPOND_PROMPT), ("human", f"Customer message: {s['message']}\nTool result: {json.dumps(s['tool_result'])}")],
+                stage="respond",
+            )
+        except ModelOutputError:
+            return {"reply": "I've passed your request to a human support agent who will follow up shortly.",
+                    "resolution": "escalated", "audit": ["respond: model unavailable; human follow-up required"]}
         return {"reply": msg.content, "resolution": "resolved", "audit": ["respond: customer reply prepared"]}
 
     def escalate(s: State):
-        if s.get("approval") == "rejected":
-            reason = "Human approver rejected the proposed action"
+        if s.get("llm_failure"):
+            audit_event = "escalate: model output unavailable"
+        elif s.get("approval") == "rejected":
+            audit_event = "escalate: approval rejected"
         elif s.get("policy_result") and not s["policy_result"]["allowed"]:
-            reason = s["policy_result"]["reason"]
+            audit_event = f"escalate: policy blocked ({s['policy_result']['reason']})"
         elif s.get("tool_result") and not s["tool_result"].get("ok"):
-            reason = f"Tool failed repeatedly: {s['tool_result'].get('error')}"
+            audit_event = "escalate: tool retries exhausted"
         else:
-            reason = s.get("decision", {}).get("reason", "Needs human review")
+            audit_event = "escalate: human review required"
         return {
             "reply": "I've passed your request to a human support agent who will follow up shortly.",
             "resolution": "escalated",
-            "audit": [f"escalate: {reason}"],
+            "audit": [audit_event],
         }
 
     def log(s: State):

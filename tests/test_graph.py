@@ -93,3 +93,62 @@ def test_refund_retry_after_lost_tool_response_applies_once(monkeypatch, checkpo
     assert out["resolution"] == "resolved"
     assert calls == 2
     assert tools.get_order("A1001")["refunded"] == 1499.0
+
+
+class _FailingFakeLLM(FakeLLM):
+    def with_structured_output(self, schema):
+        class _Failing:
+            def invoke(self, _msgs):
+                raise TimeoutError("provider unavailable")
+        return _Failing()
+
+
+class _MalformedFakeLLM(FakeLLM):
+    def with_structured_output(self, schema):
+        class _Malformed:
+            def invoke(self, _msgs):
+                return {"unexpected": "shape"}
+        return _Malformed()
+
+
+class _MalformedDecisionFakeLLM(FakeLLM):
+    def with_structured_output(self, schema):
+        if schema.__name__ != "Decision":
+            return super().with_structured_output(schema)
+        class _Malformed:
+            def invoke(self, _msgs):
+                return {"unexpected": "shape"}
+        return _Malformed()
+
+
+def test_provider_failure_retries_then_falls_back(monkeypatch, checkpointer):
+    tools.reset()
+    monkeypatch.setattr("support_agent.graph.time.sleep", lambda _delay: None)
+    graph = build_graph(_FailingFakeLLM(), FakeLLM(), checkpointer, fast_fallback=FakeLLM())
+    out = run_ticket(graph, "Please refund order A1001.", "a@example.com")
+    assert out["resolution"] == "resolved"
+    assert tools.get_order("A1001")["refunded"] == 1499.0
+
+
+def test_repeated_malformed_classification_escalates(checkpointer, monkeypatch):
+    tools.reset()
+    monkeypatch.setattr("support_agent.graph.time.sleep", lambda _delay: None)
+    graph = build_graph(
+        _MalformedFakeLLM(), FakeLLM(), checkpointer, fast_fallback=_MalformedFakeLLM()
+    )
+    out = run_ticket(graph, "Please refund order A1001.", "a@example.com")
+    assert out["resolution"] == "escalated"
+    assert "escalated for human review" in " ".join(out["audit"])
+    assert "Please refund" not in " ".join(out["audit"])
+
+
+def test_repeated_malformed_decision_escalates(checkpointer, monkeypatch):
+    tools.reset()
+    monkeypatch.setattr("support_agent.graph.time.sleep", lambda _delay: None)
+    graph = build_graph(
+        FakeLLM(), _MalformedDecisionFakeLLM(), checkpointer,
+        main_fallback=_MalformedDecisionFakeLLM(),
+    )
+    out = run_ticket(graph, "Please refund order A1001.", "a@example.com")
+    assert out["resolution"] == "escalated"
+    assert "decide: escalate" in " ".join(out["audit"])

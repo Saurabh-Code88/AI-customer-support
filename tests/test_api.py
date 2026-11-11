@@ -58,6 +58,30 @@ def test_json_logs_always_include_ticket_id():
     assert system_entry["ticket_id"] == "system"
 
 
+def test_json_logs_mask_email_addresses():
+    formatter = JsonFormatter()
+    record = logging.makeLogRecord({"name": "support_agent.test", "msg": "customer a.smith@example.com submitted", "levelno": logging.INFO, "levelname": "INFO"})
+    entry = json.loads(formatter.format(record))
+    assert entry["message"] == "customer a***@example.com submitted"
+
+
+def test_ticket_validation_uses_consistent_error_body(client):
+    response = client.post("/tickets", json={"message": "x"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert response.json()["error"]["message"] == "Invalid request."
+
+    too_long = client.post("/tickets", json={"message": "x" * 2001})
+    assert too_long.status_code == 422
+    assert too_long.json()["error"]["code"] == "validation_error"
+
+
+def test_ticket_rejects_invalid_token_email(client):
+    response = client.post("/tickets", json={"message": "Please check my order"}, headers=auth_headers("customer", "not-an-email"))
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
 def test_small_refund_resolves(client):
     r = client.post("/tickets", json={"message": "Please refund order A1001"})
     body = r.json()
