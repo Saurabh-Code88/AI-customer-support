@@ -174,6 +174,17 @@ def build_graph(fast, main, checkpointer=None, *, fast_fallback=None, main_fallb
                         "llm_failure": "demo_limit", "audit": ["decide: daily demo model-call limit reached"]}
             except ModelOutputError:
                 d = Decision(action="escalate", reason="Model output could not be validated; human review required")
+            if d.action == "use_tool" and d.tool_name is None:
+                # Some structured model responses omit this optional field even after
+                # proposing a tool action. Complete the proposal from its classified
+                # intent; policy_check still decides whether the tool may run.
+                tool_for_intent = {
+                    "order_status": "order_status",
+                    "refund": "issue_refund",
+                    "address_change": "update_address",
+                }.get(s["intent"])
+                if tool_for_intent:
+                    d = d.model_copy(update={"tool_name": tool_for_intent})
             if d.action == "clarify" and s.get("order_id") and s["intent"] in ("refund", "order_status"):
                 # The order ID is already known, so a clarifying question is wrong. Retry once.
                 try:

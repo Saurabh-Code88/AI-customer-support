@@ -67,6 +67,32 @@ def test_wrong_clarify_is_retried(checkpointer):
     assert flaky.calls == 2
 
 
+class _MissingToolNameLLM(FakeLLM):
+    """Decider that proposes using a tool but omits its name."""
+    def with_structured_output(self, schema):
+        from support_agent.schemas import Decision
+
+        if schema is not Decision:
+            return super().with_structured_output(schema)
+
+        class _MissingToolName:
+            def invoke(self, _msgs):
+                return Decision(action="use_tool", order_id="A1001", reason="order status")
+
+        return _MissingToolName()
+
+
+def test_missing_tool_name_is_completed_from_classified_intent(checkpointer):
+    tools.reset()
+    graph = build_graph(FakeLLM(), _MissingToolNameLLM(), checkpointer)
+
+    out = run_ticket(graph, "Where is order A1001?", "a@example.com")
+
+    assert out["resolution"] == "resolved"
+    assert out["decision"]["tool_name"] == "order_status"
+    assert out["tool_result"] == {"ok": True, "order_id": "A1001", "status": "delivered"}
+
+
 def test_refund_retry_after_lost_tool_response_applies_once(monkeypatch, checkpointer):
     tools.reset()
     original_run_tool = tools.run_tool
